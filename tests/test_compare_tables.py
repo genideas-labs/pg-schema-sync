@@ -116,6 +116,129 @@ def test_compare_tables_unsafe_type_change_no_alter():
     assert "CREATE TABLE public.my_table" in mig_sql[0]
     assert "ALTER TABLE" not in mig_sql[0]
 
+
+# --- 더 많은 테스트 케이스 ---
+
+def test_compare_tables_varchar_increase_with_alter():
+    """VARCHAR 길이 증가 시 ALTER TYPE 생성 확인"""
+    src_varchar_increase = [
+        {'name': 'id', 'type': 'integer', 'nullable': False, 'default': "nextval('some_seq')"},
+        {'name': 'name', 'type': 'character varying(200)', 'nullable': True, 'default': None}, # Length increased
+        {'name': 'created_at', 'type': 'timestamp with time zone', 'nullable': False, 'default': 'now()'},
+    ]
+    src_data = {"my_table": src_varchar_increase}
+    tgt_data = {"my_table": BASE_COLS_TGT} # Original was varchar(100)
+    mig_sql, skip_sql = compare_and_generate_migration(src_data, tgt_data, "TABLE", use_alter=True)
+    assert not skip_sql
+    assert len(mig_sql) == 1
+    assert 'ALTER TABLE public.my_table ALTER COLUMN "name" TYPE character varying(200);' in mig_sql[0]
+    assert "DROP TABLE" not in mig_sql[0]
+
+def test_compare_tables_varchar_decrease_no_alter():
+    """VARCHAR 길이 감소 시 DROP/CREATE 생성 확인"""
+    src_varchar_decrease = [
+        {'name': 'id', 'type': 'integer', 'nullable': False, 'default': "nextval('some_seq')"},
+        {'name': 'name', 'type': 'character varying(50)', 'nullable': True, 'default': None}, # Length decreased
+        {'name': 'created_at', 'type': 'timestamp with time zone', 'nullable': False, 'default': 'now()'},
+    ]
+    src_data = {"my_table": src_varchar_decrease}
+    tgt_data = {"my_table": BASE_COLS_TGT} # Original was varchar(100)
+    mig_sql, skip_sql = compare_and_generate_migration(src_data, tgt_data, "TABLE", use_alter=True)
+    assert not skip_sql
+    assert len(mig_sql) == 1
+    assert "DROP TABLE IF EXISTS public.my_table CASCADE;" in mig_sql[0]
+    assert "CREATE TABLE public.my_table" in mig_sql[0]
+    assert "ALTER TABLE" not in mig_sql[0]
+
+def test_compare_tables_varchar_to_text_with_alter():
+    """VARCHAR -> TEXT 변경 시 ALTER TYPE 생성 확인"""
+    src_varchar_to_text = [
+        {'name': 'id', 'type': 'integer', 'nullable': False, 'default': "nextval('some_seq')"},
+        {'name': 'name', 'type': 'text', 'nullable': True, 'default': None}, # Changed to text
+        {'name': 'created_at', 'type': 'timestamp with time zone', 'nullable': False, 'default': 'now()'},
+    ]
+    src_data = {"my_table": src_varchar_to_text}
+    tgt_data = {"my_table": BASE_COLS_TGT} # Original was varchar(100)
+    mig_sql, skip_sql = compare_and_generate_migration(src_data, tgt_data, "TABLE", use_alter=True)
+    assert not skip_sql
+    assert len(mig_sql) == 1
+    assert 'ALTER TABLE public.my_table ALTER COLUMN "name" TYPE text;' in mig_sql[0]
+    assert "DROP TABLE" not in mig_sql[0]
+
+def test_compare_tables_int_to_varchar_with_alter():
+    """INT -> VARCHAR 변경 시 ALTER TYPE 생성 확인"""
+    src_int_to_varchar = [
+        {'name': 'id', 'type': 'character varying(50)', 'nullable': False, 'default': None}, # Changed to varchar
+        {'name': 'name', 'type': 'character varying(100)', 'nullable': True, 'default': None},
+        {'name': 'created_at', 'type': 'timestamp with time zone', 'nullable': False, 'default': 'now()'},
+    ]
+    src_data = {"my_table": src_int_to_varchar}
+    tgt_data = {"my_table": BASE_COLS_TGT} # Original was integer
+    mig_sql, skip_sql = compare_and_generate_migration(src_data, tgt_data, "TABLE", use_alter=True)
+    assert not skip_sql
+    assert len(mig_sql) == 1
+    # Note: Default value might need adjustment in real scenarios, but type change itself is safe
+    assert 'ALTER TABLE public.my_table ALTER COLUMN "id" TYPE character varying(50);' in mig_sql[0]
+    assert "DROP TABLE" not in mig_sql[0]
+
+def test_compare_tables_add_and_safe_type_change():
+    """컬럼 추가 및 안전한 타입 변경 동시 발생 시 ALTER 생성 확인"""
+    src_combined_safe = [
+        {'name': 'id', 'type': 'bigint', 'nullable': False, 'default': "nextval('some_seq')"}, # Safe change
+        {'name': 'name', 'type': 'character varying(100)', 'nullable': True, 'default': None},
+        {'name': 'created_at', 'type': 'timestamp with time zone', 'nullable': False, 'default': 'now()'},
+        {'name': 'new_col', 'type': 'int', 'nullable': True, 'default': None}, # Added
+    ]
+    src_data = {"my_table": src_combined_safe}
+    tgt_data = {"my_table": BASE_COLS_TGT}
+    mig_sql, skip_sql = compare_and_generate_migration(src_data, tgt_data, "TABLE", use_alter=True)
+    assert not skip_sql
+    assert len(mig_sql) == 1
+    sql_block = mig_sql[0]
+    assert 'ALTER TABLE public.my_table ALTER COLUMN "id" TYPE bigint;' in sql_block
+    assert 'ALTER TABLE public.my_table ADD COLUMN "new_col" int;' in sql_block
+    assert "DROP TABLE" not in sql_block
+
+def test_compare_tables_add_and_unsafe_type_change():
+    """컬럼 추가 및 안전하지 않은 타입 변경 동시 발생 시 DROP/CREATE 생성 확인"""
+    src_combined_unsafe = [
+        {'name': 'id', 'type': 'integer', 'nullable': False, 'default': "nextval('some_seq')"},
+        {'name': 'name', 'type': 'integer', 'nullable': True, 'default': None}, # Unsafe change
+        {'name': 'created_at', 'type': 'timestamp with time zone', 'nullable': False, 'default': 'now()'},
+        {'name': 'new_col', 'type': 'int', 'nullable': True, 'default': None}, # Added
+    ]
+    src_data = {"my_table": src_combined_unsafe}
+    tgt_data = {"my_table": BASE_COLS_TGT}
+    mig_sql, skip_sql = compare_and_generate_migration(src_data, tgt_data, "TABLE", use_alter=True)
+    assert not skip_sql
+    assert len(mig_sql) == 1
+    assert "DROP TABLE IF EXISTS public.my_table CASCADE;" in mig_sql[0]
+    assert "CREATE TABLE public.my_table" in mig_sql[0]
+    assert "ALTER TABLE" not in mig_sql[0]
+
+def test_compare_tables_drop_and_null_change():
+    """컬럼 삭제 및 Null 제약 변경 동시 발생 시 ALTER 생성 확인"""
+    src_drop_null = [
+        {'name': 'id', 'type': 'integer', 'nullable': False, 'default': "nextval('some_seq')"},
+        {'name': 'name', 'type': 'character varying(100)', 'nullable': False, 'default': None}, # Changed
+    ]
+    tgt_drop_null = BASE_COLS_TGT + [
+        {'name': 'to_drop', 'type': 'int', 'nullable': True, 'default': None} # To be dropped
+    ]
+    src_data = {"my_table": src_drop_null}
+    tgt_data = {"my_table": tgt_drop_null}
+    mig_sql, skip_sql = compare_and_generate_migration(src_data, tgt_data, "TABLE", use_alter=True)
+    assert not skip_sql
+    assert len(mig_sql) == 1
+    sql_block = mig_sql[0]
+    assert '-- WARNING: Setting NOT NULL on column name may fail if existing data contains NULLs.' in sql_block
+    assert 'ALTER TABLE public.my_table ALTER COLUMN "name" SET NOT NULL;' in sql_block
+    assert '-- WARNING: Dropping column to_drop may cause data loss.' in sql_block
+    assert 'ALTER TABLE public.my_table DROP COLUMN "to_drop";' in sql_block
+    assert '-- WARNING: Dropping column created_at may cause data loss.' in sql_block # created_at is also dropped
+    assert 'ALTER TABLE public.my_table DROP COLUMN "created_at";' in sql_block
+    assert "DROP TABLE" not in sql_block
+
 def test_compare_tables_null_change_with_alter():
     """Null 제약 변경 시 ALTER SET/DROP NOT NULL 생성 확인"""
     # NOT NULL -> NULL 허용

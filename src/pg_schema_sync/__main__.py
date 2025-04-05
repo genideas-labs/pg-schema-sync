@@ -220,7 +220,7 @@ def is_safe_type_change(old_type, new_type):
         return True
     # 숫자 -> 문자열 (일반적으로 안전)
     elif old_type_norm in ['smallint', 'integer', 'bigint', 'numeric', 'real', 'double precision'] and \
-         new_type_norm in ['character varying', 'text']:
+         (new_type_norm.startswith('character varying') or new_type_norm == 'text'):
          return True
     # TODO: 다른 안전한 변환 추가 가능 (예: timestamp -> timestamptz)
 
@@ -236,6 +236,7 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
     """
     migration_sql = []
     skipped_sql = []
+    alter_statements = [] # 함수 시작 시 초기화
     src_keys = set(src_data.keys())
     tgt_keys = set(tgt_data.keys())
 
@@ -263,7 +264,7 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
             cols_to_drop = tgt_col_names - src_col_names
             cols_to_compare = src_col_names.intersection(tgt_col_names)
 
-            alter_statements = []
+            # alter_statements = [] # 여기서 초기화 제거
             needs_recreate = False # ALTER로 처리 불가능한 변경이 있는지 여부
 
             # 공통 컬럼이 하나도 없고, 추가/삭제할 컬럼이 있다면 재 생성 필요 (버그 수정)

@@ -334,6 +334,7 @@ class PgSchemaSyncServer:
                 "target_name": JsonSchema(type="string", description="Name of the target database configuration key in config.yaml"),
                 "exclude_tables": JsonSchema(type="array", items=JsonSchema(type="string"), description="List of table names to exclude", default=[]),
                 "exclude_indexes": JsonSchema(type="array", items=JsonSchema(type="string"), description="List of index names to exclude", default=[]),
+                "use_alter": JsonSchema(type="boolean", description="EXPERIMENTAL: Use ALTER TABLE for column add/drop", default=False),
             },
             required=["target_name"],
         )
@@ -403,6 +404,7 @@ class PgSchemaSyncServer:
                 source_db_config = config['source']
                 exclude_tables = args.get('exclude_tables', [])
                 exclude_indexes = args.get('exclude_indexes', [])
+                use_alter_flag = args.get('use_alter', False) # Get the flag
 
                 print(f"Connecting to source DB...")
                 src_conn = get_connection(source_db_config.copy()) # Use copy
@@ -461,11 +463,12 @@ class PgSchemaSyncServer:
                     all_migration_sql = []
                     all_skipped_sql = []
 
+                    # Pass use_alter flag to compare function for TABLE type
                     mig_sql, skip_sql = compare_and_generate_migration(src_enum_values, tgt_enum_values, "TYPE", src_enum_ddls=src_enum_ddls)
                     all_migration_sql.extend(mig_sql)
                     all_skipped_sql.extend(skip_sql)
 
-                    mig_sql, skip_sql = compare_and_generate_migration(src_tables_meta, tgt_tables_meta, "TABLE")
+                    mig_sql, skip_sql = compare_and_generate_migration(src_tables_meta, tgt_tables_meta, "TABLE", use_alter=use_alter_flag)
                     all_migration_sql.extend(mig_sql)
                     all_skipped_sql.extend(skip_sql)
 

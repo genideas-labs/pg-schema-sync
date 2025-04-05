@@ -74,6 +74,7 @@ python -m pg_schema_sync [OPTIONS]
 *   `--verify`: 스키마 차이점만 검증하고 보고합니다. SQL 파일을 생성하거나 데이터베이스를 변경하지 않습니다.
 *   `--commit` (기본값): 스키마를 비교하고, 변경이 필요한 SQL을 생성하여 `history/migrate.*.sql` 파일에 저장한 후, 타겟 데이터베이스에 해당 SQL을 **실행하고 커밋**합니다. 건너뛴 객체 정보는 `history/skip.*.sql`에 저장됩니다.
 *   `--no-commit`: `--commit`과 동일하게 SQL 파일을 생성하지만, 타겟 데이터베이스에 **실행하지는 않습니다**. 생성된 SQL 파일을 검토한 후 수동으로 적용할 때 유용합니다.
+*   `--use-alter` (실험적): 테이블 컬럼 추가/삭제 시 `DROP/CREATE` 대신 `ALTER TABLE` 문 생성을 시도합니다. 컬럼 타입 변경 등 복잡한 변경은 여전히 `DROP/CREATE`로 처리될 수 있습니다. **데이터 손실 위험이 있으므로 주의해서 사용하세요.**
 
 **실행 예시:**
 
@@ -144,6 +145,7 @@ MCP 클라이언트를 통해 다음 도구들을 사용할 수 있습니다. �
 *   `verify_schema`: 소스와 타겟 데이터베이스 스키마의 차이점을 검증하고 보고서를 반환합니다. (`--verify` 옵션과 유사)
     *   입력: `{ "target_name": "TARGET_KEY_IN_CONFIG", "exclude_tables": [...], "exclude_indexes": [...] }`
 *   `generate_migration_sql`: 타겟 스키마를 업데이트하기 위한 마이그레이션 SQL을 생성하여 반환합니다 (적용 안 함). (`--no-commit` 옵션과 유사)
-    *   입력: `{ "target_name": "TARGET_KEY_IN_CONFIG", "exclude_tables": [...], "exclude_indexes": [...] }`
+    *   입력: `{ "target_name": "TARGET_KEY_IN_CONFIG", "exclude_tables": [...], "exclude_indexes": [...], "use_alter": false }`
 *   `apply_schema_migration`: 마이그레이션 SQL을 생성하고 지정된 타겟 데이터베이스에 직접 적용합니다. (`--commit` 옵션과 유사)
-    *   입력: `{ "target_name": "TARGET_KEY_IN_CONFIG", "exclude_tables": [...], "exclude_indexes": [...] }`
+    *   입력: `{ "target_name": "TARGET_KEY_IN_CONFIG", "exclude_tables": [...], "exclude_indexes": [...], "use_alter": false }`
+    *   **주의:** `use_alter: true` 사용 시 생성된 `ALTER TABLE DROP COLUMN` 문은 데이터 손실을 유발할 수 있습니다.

@@ -196,11 +196,42 @@ def fetch_indexes(conn):
     cur.close()
     return indexes, pkey_indexes # 두 개의 딕셔너리 반환
 
-# --- 비교 후 migration SQL 생성 (타입별 로직 분기, Enum DDL 참조 추가) ---
-def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=None):
+# --- 안전한 타입 변경 판단 함수 ---
+def is_safe_type_change(old_type, new_type):
+    """암시적 변환이 가능하고 안전한 타입 변경인지 판단합니다."""
+    old_type_norm = normalize_sql(old_type)
+    new_type_norm = normalize_sql(new_type)
+
+    # varchar 길이 증가 또는 text로 변경
+    if old_type_norm.startswith('character varying') and (new_type_norm.startswith('character varying') or new_type_norm == 'text'):
+        try:
+            old_len_match = re.search(r'\((\d+)\)', old_type_norm)
+            new_len_match = re.search(r'\((\d+)\)', new_type_norm)
+            old_len = int(old_len_match.group(1)) if old_len_match else float('inf')
+            new_len = int(new_len_match.group(1)) if new_len_match else float('inf')
+            # 길이가 같거나 증가하는 경우 또는 text로 변경하는 경우 안전
+            return new_len >= old_len or new_type_norm == 'text'
+        except:
+            return False # 길이 파싱 실패 시 안전하지 않음으로 간주
+    # 숫자 타입 확장 (smallint -> int -> bigint)
+    elif old_type_norm == 'smallint' and new_type_norm in ['integer', 'bigint']:
+        return True
+    elif old_type_norm == 'integer' and new_type_norm == 'bigint':
+        return True
+    # 숫자 -> 문자열 (일반적으로 안전)
+    elif old_type_norm in ['smallint', 'integer', 'bigint', 'numeric', 'real', 'double precision'] and \
+         new_type_norm in ['character varying', 'text']:
+         return True
+    # TODO: 다른 안전한 변환 추가 가능 (예: timestamp -> timestamptz)
+
+    return False # 그 외는 안전하지 않음으로 간주
+
+# --- 비교 후 migration SQL 생성 (타입별 로직 분기, Enum DDL 참조 추가, ALTER TABLE 지원 추가) ---
+def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=None, use_alter=False):
     """
     소스와 타겟 데이터를 비교하여 마이그레이션 SQL과 건너뛴 SQL을 생성합니다.
     obj_type에 따라 비교 방식을 다르게 적용합니다.
+    use_alter=True일 경우, 테이블 컬럼 추가/삭제에 대해 ALTER TABLE 사용 시도.
     Enum 타입의 DDL 생성을 위해 src_enum_ddls 딕셔너리가 필요합니다.
     """
     migration_sql = []
@@ -223,22 +254,115 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
         ddl = "" # 변경 시 사용할 DDL (주로 소스 기준)
 
         if obj_type == "TABLE":
-            # 테이블: 컬럼 메타데이터 비교
-            src_cols = src_data[name]
-            tgt_cols = tgt_data[name]
-            # 컬럼 수, 이름, 타입, Null 여부, 기본값 등을 비교
-            # 주의: 기본값 비교는 복잡할 수 있음 (표현 방식 차이)
-            # 간단하게 컬럼 수와 이름/타입/Null여부만 비교하거나, 더 정교한 비교 로직 필요
-            if len(src_cols) != len(tgt_cols) or \
-               any(sc['name'] != tc['name'] or \
-                   normalize_sql(sc['type']) != normalize_sql(tc['type']) or \
-                   sc['nullable'] != tc['nullable'] # or \
-                   # normalize_sql(str(sc['default'])) != normalize_sql(str(tc['default'])) # 기본값 비교는 불안정할 수 있음
-                   for sc, tc in zip(src_cols, tgt_cols)):
+            src_cols_map = {col['name']: col for col in src_data[name]}
+            tgt_cols_map = {col['name']: col for col in tgt_data[name]}
+            src_col_names = set(src_cols_map.keys())
+            tgt_col_names = set(tgt_cols_map.keys())
+
+            cols_to_add = src_col_names - tgt_col_names
+            cols_to_drop = tgt_col_names - src_col_names
+            cols_to_compare = src_col_names.intersection(tgt_col_names)
+
+            alter_statements = []
+            needs_recreate = False # ALTER로 처리 불가능한 변경이 있는지 여부
+
+            # 공통 컬럼이 하나도 없고, 추가/삭제할 컬럼이 있다면 재 생성 필요 (버그 수정)
+            if not cols_to_compare and (cols_to_add or cols_to_drop):
+                 needs_recreate = True
+
+            # 컬럼 정의 비교 (타입, Null 여부 등) - needs_recreate가 아직 False일 때만 수행
+            if not needs_recreate:
+                for col_name in cols_to_compare:
+                    src_col = src_cols_map[col_name]
+                    tgt_col = tgt_cols_map[col_name]
+                    src_type_norm = normalize_sql(src_col['type'])
+                    tgt_type_norm = normalize_sql(tgt_col['type'])
+
+                    # 1. 타입 변경 확인
+                    if src_type_norm != tgt_type_norm:
+                        if use_alter and is_safe_type_change(tgt_type_norm, src_type_norm):
+                            # 안전한 타입 변경이면 ALTER TYPE 추가
+                            quoted_col_name = f'"{col_name}"' # 따옴표 추가
+                            alter_statements.append(f"ALTER TABLE public.{name} ALTER COLUMN {quoted_col_name} TYPE {src_col['type']};")
+                        else:
+                            # 안전하지 않은 타입 변경이면 재 생성 필요
+                            needs_recreate = True
+                            break
+
+                    # 2. Null 허용 여부 변경 확인 (타입이 동일할 때만 고려)
+                    elif src_col['nullable'] != tgt_col['nullable']:
+                        if use_alter:
+                            if src_col['nullable'] is False: # NOT NULL로 변경
+                                alter_statements.append(f"-- WARNING: Setting NOT NULL on column {col_name} may fail if existing data contains NULLs.")
+                                quoted_col_name = f'"{col_name}"' # 따옴표 추가
+                                alter_statements.append(f"ALTER TABLE public.{name} ALTER COLUMN {quoted_col_name} SET NOT NULL;")
+                            else: # NULL 허용으로 변경
+                                quoted_col_name = f'"{col_name}"' # 따옴표 추가
+                                alter_statements.append(f"ALTER TABLE public.{name} ALTER COLUMN {quoted_col_name} DROP NOT NULL;")
+                        else:
+                             # use_alter=False 이면 재 생성 필요
+                             needs_recreate = True
+                             break
+
+                    # 3. 기본값 변경 확인 (현재 로직에서는 비교 안 함, 필요시 추가)
+                    # if normalize_sql(str(src_col.get('default',''))) != normalize_sql(str(tgt_col.get('default',''))):
+                    #     if use_alter:
+                    #         # ALTER DEFAULT 추가/변경/삭제 로직
+                    #     else:
+                    #         needs_recreate = True
+                    #         break
+
+            # ALTER 문 생성 (컬럼 추가/삭제) - needs_recreate가 False이고 use_alter=True일 때만
+            if not needs_recreate and use_alter:
+                if cols_to_add:
+                    for col_name in cols_to_add:
+                        col = src_cols_map[col_name]
+                        col_def = f"{col['name']} {col['type']}"
+                        if col['default'] is not None:
+                            col_def += f" DEFAULT {col['default']}"
+                        if not col['nullable']:
+                            col_def += " NOT NULL"
+                        # sql.Identifier 사용 위해 conn 객체 필요 -> 임시 처리 (f-string 오류 수정)
+                        default_clause = f" DEFAULT {col['default']}" if col.get('default') is not None else ""
+                        not_null_clause = " NOT NULL" if not col.get('nullable', True) else ""
+                        # 컬럼 이름에 따옴표 추가 (psycopg2.sql.Identifier 대신 임시 사용)
+                        quoted_col_name = f'"{col_name}"'
+                        alter_statements.append(f"ALTER TABLE public.{name} ADD COLUMN {quoted_col_name} {col['type']}{default_clause}{not_null_clause};")
+                if cols_to_drop:
+                    for col_name in cols_to_drop:
+                        # 컬럼 삭제는 위험하므로 주석 추가
+                        alter_statements.append(f"-- WARNING: Dropping column {col_name} may cause data loss.")
+                        # 컬럼 이름에 따옴표 추가 (psycopg2.sql.Identifier 대신 임시 사용)
+                        quoted_col_name = f'"{col_name}"'
+                        alter_statements.append(f"ALTER TABLE public.{name} DROP COLUMN {quoted_col_name};")
+
+                if alter_statements: # ALTER 문이 생성된 경우 (추가/삭제/변경 포함)
+                    migration_sql.append(f"-- ALTER TABLE {name} for column changes\n" + "\n".join(alter_statements) + "\n")
+                    are_different = True # 마이그레이션 SQL이 생성되었으므로 different로 처리
+                else:
+                    # ALTER 문 없고, needs_recreate도 False이면 변경 없음
+                    are_different = False
+
+            # 재 생성 필요 여부 최종 결정
+            # needs_recreate가 True이면 무조건 재 생성
+            if needs_recreate:
                 are_different = True
-                ddl = generate_create_table_ddl(name, src_cols) # 변경 시 소스 기준으로 DDL 생성
+                ddl = generate_create_table_ddl(name, src_data[name]) # 재 생성 DDL 준비
+                alter_statements = [] # ALTER 문은 무시
+            # use_alter=False 이고 컬럼 구성이 다르면 재 생성
+            elif not use_alter and (len(src_cols_map) != len(tgt_cols_map) or \
+                                    any(sc['name'] != tc['name'] or \
+                                        normalize_sql(sc['type']) != normalize_sql(tc['type']) or \
+                                        sc['nullable'] != tc['nullable']
+                                        for sc, tc in zip(src_data[name], tgt_data[name]))):
+                 are_different = True
+                 ddl = generate_create_table_ddl(name, src_data[name]) # 재 생성 DDL 준비
+                 alter_statements = [] # ALTER 문은 무시
+            elif not alter_statements:
+                 # 재 생성 필요 없고, ALTER 문도 없으면 변경 없음
+                 are_different = False
+
         elif obj_type == "TYPE": # Enum 타입 가정
-            # Enum: 값 목록 비교 (fetch_enums_values 결과 사용)
             src_values = src_data[name]
             tgt_values = tgt_data[name]
             if src_values != tgt_values:
@@ -253,12 +377,15 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                 are_different = True
                 ddl = src_data[name] # 변경 시 소스 DDL 사용
 
-        # 비교 결과에 따라 SQL 생성
-        if are_different:
+        # 비교 결과에 따라 SQL 생성 (TABLE 타입은 위에서 처리됨)
+        if obj_type != "TABLE" and are_different:
+            # TABLE 외 다른 타입이 다르거나, TABLE이 ALTER 불가하여 재 생성 필요한 경우
             migration_sql.append(f"-- {obj_type} {name} differs. Recreating.\nDROP {obj_type.upper()} IF EXISTS public.{name} CASCADE;\n{ddl}\n")
-        else:
-            # 동일한 경우: 스킵 처리 (옵션 C)
-            # 스킵 시 사용할 DDL (소스 기준)
+        elif obj_type == "TABLE" and are_different and not alter_statements:
+             # TABLE이 다르지만 ALTER 문이 생성되지 않은 경우 (재 생성 필요)
+             migration_sql.append(f"-- TABLE {name} differs significantly. Recreating.\nDROP TABLE IF EXISTS public.{name} CASCADE;\n{ddl}\n")
+        elif not are_different and not alter_statements: # 테이블 포함 모든 타입이 동일하고 ALTER 문도 없는 경우
+            # 동일한 경우: 스킵 처리
             original_ddl = ""
             if obj_type == "TABLE":
                  original_ddl = generate_create_table_ddl(name, src_data[name])
@@ -332,6 +459,9 @@ def main():
     # Commit flag (only relevant if --verify is not used)
     parser.add_argument('--commit', action=argparse.BooleanOptionalAction, default=True,
                         help="Execute the generated migration SQL on the target database. Use --no-commit to only generate files. Ignored if --verify is used.")
+    # Experimental ALTER TABLE flag
+    parser.add_argument('--use-alter', action='store_true', default=False,
+                        help="EXPERIMENTAL: Use ALTER TABLE for column additions/deletions instead of DROP/CREATE. Use with caution.")
     args = parser.parse_args()
     # --- 인수 파싱 끝 ---
 
@@ -459,6 +589,8 @@ def main():
 
     # --- 마이그레이션/파일 생성 모드 (기존 로직) ---
     print("\n--- Migration Generation Mode ---")
+    if args.use_alter:
+        print("--- Using experimental ALTER TABLE mode ---")
     all_migration_sql = [] # 실제 마이그레이션 SQL 저장
     all_skipped_sql = []   # 건너뛴 SQL 저장
 
@@ -467,10 +599,11 @@ def main():
     # Enum 비교 시 값 목록(values)을 사용하고, DDL 생성을 위해 src_enum_ddls 전달
     mig_sql, skip_sql = compare_and_generate_migration(src_enum_values, tgt_enum_values, "TYPE", src_enum_ddls=src_enum_ddls)
     all_migration_sql.extend(mig_sql)
-    all_skipped_sql.extend(skip_sql) # 이제 스킵된 Enum DDL도 올바르게 포함됨
+    all_skipped_sql.extend(skip_sql)
 
     print("Comparing Tables (Metadata)...")
-    mig_sql, skip_sql = compare_and_generate_migration(src_tables_meta, tgt_tables_meta, "TABLE")
+    # use_alter 옵션 전달
+    mig_sql, skip_sql = compare_and_generate_migration(src_tables_meta, tgt_tables_meta, "TABLE", use_alter=args.use_alter)
     all_migration_sql.extend(mig_sql)
     all_skipped_sql.extend(skip_sql)
 

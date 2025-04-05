@@ -36,3 +36,11 @@ mcp = [
     "modelcontextprotocol-sdk",
     "PyYAML", # Already in core deps, but good for clarity if MCP feature relies on it
 ]
+dev = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "src"
+]

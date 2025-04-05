@@ -1,0 +1,16 @@
+source:
+  host: aws-0-ap-northeast-2.pooler.supabase.com
+  port: 6543
+  db: postgres
+  username: postgres.xxx
+  password: yyy
+
+targets:
+  gcp_test:
+    host: aa.bb.cc.dd
+    port: 5432
+    db: postgres
+    username:
+      postgres
+    password:
+      eeeeeeeeeeeeeeee

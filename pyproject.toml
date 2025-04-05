@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pg-schema-sync"
+version = "0.1.0"
+authors = [
+  { name="Elliot Shin", email="wodshin@gmail.com" }, 
+]
+description = "A tool to compare PostgreSQL schemas and generate migration SQL."
+readme = "README.md"
+requires-python = ">=3.8" # main.py에서 사용하는 f-string 등을 고려하여 적절한 버전 설정
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "MIT License", 
+    "Operating System :: OS Independent",
+    "Topic :: Database",
+    "Topic :: Software Development :: Version Control :: Schema Migration",
+]
+dependencies = [
+    "psycopg2-binary",
+    "PyYAML",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/genideas-labs/pg-schema-sync" # TODO: 실제 프로젝트 URL로 변경하세요
+"Bug Tracker" = "https://github.com/genideas-labs/pg-schema-sync/issues" # TODO: 실제 프로젝트 URL로 변경하세요
+
+[project.scripts]
+pg-schema-sync = "pg_schema_sync.__main__:main"

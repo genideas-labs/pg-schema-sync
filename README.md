@@ -112,3 +112,38 @@ python -m pg_schema_sync [OPTIONS]
 *   `--commit` 옵션은 타겟 데이터베이스를 직접 변경하므로 주의해서 사용해야 합니다. 특히 `DROP ... CASCADE`와 같은 명령어가 포함될 수 있으므로, 중요한 데이터베이스에서는 `--no-commit` 옵션으로 생성된 SQL을 먼저 검토하는 것을 강력히 권장합니다.
 *   현재 스키마 비교는 주로 객체의 존재 여부 및 정의의 유사성을 기반으로 합니다. 복잡한 의존성이나 데이터 마이그레이션은 처리하지 않습니다.
 *   테이블 비교 시 컬럼 순서 변경은 감지하지 못할 수 있습니다. 컬럼 기본값 비교는 표현 방식 차이로 인해 완벽하지 않을 수 있습니다.
+
+## MCP 서버 (Wrapper)
+
+이 프로젝트는 Model Context Protocol (MCP) 서버 Wrapper를 포함하여, 기존 `pg-schema-sync` 기능을 MCP 클라이언트(예: Cline)를 통해 사용할 수 있도록 합니다. Wrapper 서버는 `mcp_server` 디렉토리에 위치합니다.
+
+**설치 및 실행:**
+
+1.  **기본 패키지 설치:** 먼저 위 "설치" 섹션에 따라 `pg-schema-sync` 패키지를 설치합니다.
+2.  **Wrapper 의존성 설치:** MCP 서버 Wrapper를 실행하기 위해 추가 의존성을 설치해야 합니다.
+    ```bash
+    pip install -r mcp_server/requirements.txt
+    ```
+3.  **설정 파일 경로 지정:** Wrapper 서버는 데이터베이스 연결 정보가 포함된 `config.yaml` 파일의 경로를 알아야 합니다. `PG_SYNC_CONFIG_PATH` 환경 변수를 설정하여 파일의 전체 경로를 지정합니다.
+    ```bash
+    # 리눅스/맥
+    export PG_SYNC_CONFIG_PATH="/path/to/your/config.yaml"
+    # 윈도우
+    # set PG_SYNC_CONFIG_PATH="C:\path\to\your\config.yaml"
+    ```
+4.  **서버 실행:** 환경 변수가 설정된 상태에서 Wrapper 서버를 실행합니다.
+    ```bash
+    python mcp_server/index.py
+    ```
+    (또는 MCP 클라이언트 설정 파일에 이 명령어를 등록하여 자동으로 실행되도록 할 수 있습니다.)
+
+**제공되는 도구:**
+
+MCP 클라이언트를 통해 다음 도구들을 사용할 수 있습니다. 각 도구는 `PG_SYNC_CONFIG_PATH` 환경 변수에 지정된 `config.yaml` 파일을 사용합니다.
+
+*   `verify_schema`: 소스와 타겟 데이터베이스 스키마의 차이점을 검증하고 보고서를 반환합니다. (`--verify` 옵션과 유사)
+    *   입력: `{ "target_name": "TARGET_KEY_IN_CONFIG", "exclude_tables": [...], "exclude_indexes": [...] }`
+*   `generate_migration_sql`: 타겟 스키마를 업데이트하기 위한 마이그레이션 SQL을 생성하여 반환합니다 (적용 안 함). (`--no-commit` 옵션과 유사)
+    *   입력: `{ "target_name": "TARGET_KEY_IN_CONFIG", "exclude_tables": [...], "exclude_indexes": [...] }`
+*   `apply_schema_migration`: 마이그레이션 SQL을 생성하고 지정된 타겟 데이터베이스에 직접 적용합니다. (`--commit` 옵션과 유사)
+    *   입력: `{ "target_name": "TARGET_KEY_IN_CONFIG", "exclude_tables": [...], "exclude_indexes": [...] }`

@@ -1,0 +1,3 @@
+modelcontextprotocol-sdk
+psycopg2-binary
+PyYAML

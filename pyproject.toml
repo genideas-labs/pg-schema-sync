@@ -10,10 +10,11 @@ authors = [
 ]
 description = "A tool to compare PostgreSQL schemas and generate migration SQL."
 readme = "README.md"
+license = "MIT" # 간단한 SPDX 문자열 사용
 requires-python = ">=3.8" # main.py에서 사용하는 f-string 등을 고려하여 적절한 버전 설정
 classifiers = [
     "Programming Language :: Python :: 3",
-    "MIT License", 
+    # "License :: OSI Approved :: MIT License", # 제거
     "Operating System :: OS Independent",
     "Topic :: Database",
     "Topic :: Software Development :: Version Control :: Schema Migration",
@@ -29,3 +30,9 @@ dependencies = [
 
 [project.scripts]
 pg-schema-sync = "pg_schema_sync.__main__:main"
+
+[project.optional-dependencies]
+mcp = [
+    "modelcontextprotocol-sdk",
+    "PyYAML", # Already in core deps, but good for clarity if MCP feature relies on it
+]

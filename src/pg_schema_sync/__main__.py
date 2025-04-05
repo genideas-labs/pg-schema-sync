@@ -243,10 +243,11 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
     # 소스에만 있는 객체 처리
     for name in src_keys - tgt_keys:
         if obj_type == "TABLE":
-            # 테이블 메타데이터로부터 DDL 생성
             ddl = generate_create_table_ddl(name, src_data[name])
-        else: # 다른 타입은 src_data에 DDL이 있다고 가정
-             ddl = src_data[name]
+        elif obj_type == "TYPE": # 소스에만 있는 Enum 처리
+             ddl = src_enum_ddls.get(name, f"-- ERROR: DDL not found for Enum {name}")
+        else: # View, Function, Index 등
+             ddl = src_data.get(name, f"-- ERROR: DDL not found for {obj_type} {name}")
         migration_sql.append(f"-- CREATE {obj_type} {name}\n{ddl}\n")
 
     # 양쪽에 모두 있는 객체 비교 처리
@@ -416,10 +417,14 @@ def normalize_sql(sql_text):
     # sql_text = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL) # 필요 시 추가
     # 소문자로 변환
     sql_text = sql_text.lower()
+    # 괄호, 쉼표, 세미콜론 주변 공백 제거
+    sql_text = re.sub(r'\s*([(),;])\s*', r'\1', sql_text)
+    # 등호(=) 등 연산자 주변 공백 제거 (더 많은 연산자 추가 가능)
+    sql_text = re.sub(r'\s*([=<>!+-/*%])\s*', r'\1', sql_text)
     # 여러 공백 (스페이스, 탭, 개행 포함)을 단일 스페이스로 변경
     sql_text = re.sub(r'\s+', ' ', sql_text)
-    # 앞뒤 공백 제거
-    return sql_text.strip()
+    # 앞뒤 공백 제거 및 마지막 세미콜론 제거 (옵션)
+    return sql_text.strip().rstrip(';')
 
 
 # --- 검증 결과 출력 함수 ---

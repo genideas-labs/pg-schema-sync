@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pg-schema-sync"
-version = "0.2.1" # Bump version for bug fixes and tests
+version = "0.2.2" # Add testing doc
 authors = [
   { name="Elliot Shin", email="wodshin@gmail.com" }, 
 ]

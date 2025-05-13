@@ -196,6 +196,21 @@ def fetch_indexes(conn):
     cur.close()
     return indexes, pkey_indexes # 두 개의 딕셔너리 반환
 
+# --- Sequence DDL 조회 ---
+def fetch_sequences(conn):
+    """시퀀스 DDL을 조회합니다."""
+    cur = conn.cursor()
+    query = """
+    SELECT sequence_name,
+           'CREATE SEQUENCE public.' || sequence_name || ';' AS ddl
+    FROM information_schema.sequences
+    WHERE sequence_schema = 'public';
+    """
+    cur.execute(query)
+    sequences = {seq_name: ddl for seq_name, ddl in cur.fetchall()}
+    cur.close()
+    return sequences
+
 # --- 안전한 타입 변경 판단 함수 ---
 def is_safe_type_change(old_type, new_type):
     """암시적 변환이 가능하고 안전한 타입 변경인지 판단합니다."""
@@ -245,9 +260,11 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
         if obj_type == "TABLE":
             ddl = generate_create_table_ddl(name, src_data[name])
         elif obj_type == "TYPE": # 소스에만 있는 Enum 처리
-             ddl = src_enum_ddls.get(name, f"-- ERROR: DDL not found for Enum {name}")
+            ddl = src_enum_ddls.get(name, f"-- ERROR: DDL not found for Enum {name}")
+        elif obj_type == "SEQUENCE": # 소스에만 있는 Sequence 처리
+            ddl = src_data.get(name, f"-- ERROR: DDL not found for Sequence {name}")
         else: # View, Function, Index 등
-             ddl = src_data.get(name, f"-- ERROR: DDL not found for {obj_type} {name}")
+            ddl = src_data.get(name, f"-- ERROR: DDL not found for {obj_type} {name}")
         migration_sql.append(f"-- CREATE {obj_type} {name}\n{ddl}\n")
 
     # 양쪽에 모두 있는 객체 비교 처리
@@ -371,8 +388,13 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                 are_different = True
                 # Enum DDL은 src_enum_ddls 에서 가져옴
                 ddl = src_enum_ddls.get(name, f"-- ERROR: DDL not found for Enum {name}")
+        elif obj_type == "FUNCTION":
+            # 함수는 원본 DDL로 비교 (정규화 시 달러 인용 문제 발생 가능성)
+            if src_data[name] != tgt_data[name]:
+                are_different = True
+                ddl = src_data[name]
         else:
-            # 나머지 타입 (View, Function, Index): 정규화된 DDL 비교 (src_data가 DDL 딕셔너리라고 가정)
+            # 나머지 타입 (View, Index, Sequence): 정규화된 DDL 비교
             src_ddl_norm = normalize_sql(src_data[name])
             tgt_ddl_norm = normalize_sql(tgt_data[name])
             if src_ddl_norm != tgt_ddl_norm:
@@ -382,7 +404,8 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
         # 비교 결과에 따라 SQL 생성 (TABLE 타입은 위에서 처리됨)
         if obj_type != "TABLE" and are_different:
             # TABLE 외 다른 타입이 다르거나, TABLE이 ALTER 불가하여 재 생성 필요한 경우
-            migration_sql.append(f"-- {obj_type} {name} differs. Recreating.\nDROP {obj_type.upper()} IF EXISTS public.{name} CASCADE;\n{ddl}\n")
+            action = "Recreating" if obj_type != "FUNCTION" else "Updating" # 함수는 Update로 표시 (DROP/CREATE 동일)
+            migration_sql.append(f"-- {obj_type} {name} differs. {action}.\nDROP {obj_type.upper()} IF EXISTS public.{name} CASCADE;\n{ddl}\n")
         elif obj_type == "TABLE" and are_different and not alter_statements:
              # TABLE이 다르지만 ALTER 문이 생성되지 않은 경우 (재 생성 필요)
              migration_sql.append(f"-- TABLE {name} differs significantly. Recreating.\nDROP TABLE IF EXISTS public.{name} CASCADE;\n{ddl}\n")
@@ -393,7 +416,7 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                  original_ddl = generate_create_table_ddl(name, src_data[name])
             elif obj_type == "TYPE":
                  original_ddl = src_enum_ddls.get(name, "") # 스킵 로그용 Enum DDL
-            else: # View, Function, Index 등
+            else: # View, Function, Index, Sequence 등
                  original_ddl = src_data.get(name, "") # src_data가 DDL 딕셔너리라고 가정
 
             skipped_sql.append(f"-- {obj_type} {name} is up-to-date; skipping.\n")
@@ -408,23 +431,42 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
 
 # --- SQL 정규화 함수 ---
 def normalize_sql(sql_text):
-    """SQL 문자열에서 주석 제거, 소문자 변환, 공백 정규화 수행"""
+    """SQL 문자열에서 주석 제거, 소문자 변환, 공백 정규화 수행 (달러 인용 문자열 보호)"""
     if not sql_text:
         return ""
+
+    # 달러 인용 문자열 추출 및 임시 치환
+    dollar_quoted_strings = []
+    def replace_dollar_quoted(match):
+        dollar_quoted_strings.append(match.group(0))
+        return f"__DOLLAR_QUOTED_STRING_{len(dollar_quoted_strings)-1}__"
+
+    # 정규 표현식 수정: 시작과 끝 태그가 동일해야 함 ($tag$...$tag$)
+    # 태그는 비어있거나, 문자로만 구성될 수 있음
+    sql_text_no_dollars = re.sub(r"(\$([a-zA-Z_]\w*)?\$).*?\1", replace_dollar_quoted, sql_text, flags=re.DOTALL)
+
     # -- 스타일 주석 제거
-    sql_text = re.sub(r'--.*$', '', sql_text, flags=re.MULTILINE)
+    processed_sql = re.sub(r'--.*$', '', sql_text_no_dollars, flags=re.MULTILINE)
     # /* */ 스타일 주석 제거 (간단한 경우만 처리, 중첩 불가)
-    # sql_text = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL) # 필요 시 추가
-    # 소문자로 변환
-    sql_text = sql_text.lower()
+    # processed_sql = re.sub(r'/\*.*?\*/', '', processed_sql, flags=re.DOTALL) # 필요 시 추가
+
+    # 소문자로 변환 (달러 인용 제외 부분만)
+    processed_sql = processed_sql.lower()
     # 괄호, 쉼표, 세미콜론 주변 공백 제거
-    sql_text = re.sub(r'\s*([(),;])\s*', r'\1', sql_text)
+    processed_sql = re.sub(r'\s*([(),;])\s*', r'\1', processed_sql)
     # 등호(=) 등 연산자 주변 공백 제거 (더 많은 연산자 추가 가능)
-    sql_text = re.sub(r'\s*([=<>!+-/*%])\s*', r'\1', sql_text)
+    processed_sql = re.sub(r'\s*([=<>!+-/*%])\s*', r'\1', processed_sql)
     # 여러 공백 (스페이스, 탭, 개행 포함)을 단일 스페이스로 변경
-    sql_text = re.sub(r'\s+', ' ', sql_text)
-    # 앞뒤 공백 제거 및 마지막 세미콜론 제거 (옵션)
-    return sql_text.strip().rstrip(';')
+    processed_sql = re.sub(r'\s+', ' ', processed_sql)
+    # 앞뒤 공백 제거
+    processed_sql = processed_sql.strip()
+
+    # 임시 치환된 달러 인용 문자열 복원
+    for i, original_string in enumerate(dollar_quoted_strings):
+        processed_sql = processed_sql.replace(f"__DOLLAR_QUOTED_STRING_{i}__", original_string)
+
+    # 마지막 세미콜론 제거 (옵션)
+    return processed_sql.rstrip(';')
 
 
 # --- 검증 결과 출력 함수 ---
@@ -558,6 +600,10 @@ def main():
     print("Fetching Index DDLs...")
     src_indexes, src_pkey_indexes = fetch_indexes(src_conn) # 비교 및 DDL 생성용 + 정보용
     tgt_indexes, tgt_pkey_indexes = fetch_indexes(tgt_conn) # 비교용 + 정보용
+
+    print("Fetching Sequence DDLs...")
+    src_sequences = fetch_sequences(src_conn) # 비교 및 DDL 생성용
+    tgt_sequences = fetch_sequences(tgt_conn) # 비교용
     # --- 데이터 조회 끝 ---
 
 
@@ -567,6 +613,7 @@ def main():
         all_synced = True
         # 검증 시에는 이름 목록만 비교
         all_synced &= print_verification_report(src_enum_ddls, tgt_enum_ddls, "Enums (Types)")
+        all_synced &= print_verification_report(src_sequences, tgt_sequences, "Sequences")
         all_synced &= print_verification_report(src_tables_meta, tgt_tables_meta, "Tables")
         all_synced &= print_verification_report(src_views, tgt_views, "Views")
         all_synced &= print_verification_report(src_functions, tgt_functions, "Functions")
@@ -600,16 +647,21 @@ def main():
     all_migration_sql = [] # 실제 마이그레이션 SQL 저장
     all_skipped_sql = []   # 건너뛴 SQL 저장
 
-    # 순서: enum, table, view, function, index
+    # 순서: enum, sequence, table, view, function, index
     print("Comparing Enums (Values)...")
     # Enum 비교 시 값 목록(values)을 사용하고, DDL 생성을 위해 src_enum_ddls 전달
     mig_sql, skip_sql = compare_and_generate_migration(src_enum_values, tgt_enum_values, "TYPE", src_enum_ddls=src_enum_ddls)
     all_migration_sql.extend(mig_sql)
     all_skipped_sql.extend(skip_sql)
 
+    print("Comparing Sequences (DDL)...")
+    mig_sql, skip_sql = compare_and_generate_migration(src_sequences, tgt_sequences, "SEQUENCE")
+    all_migration_sql.extend(mig_sql)
+    all_skipped_sql.extend(skip_sql)
+
     print("Comparing Tables (Metadata)...")
     # use_alter 옵션 전달
-    mig_sql, skip_sql = compare_and_generate_migration(src_tables_meta, tgt_tables_meta, "TABLE", use_alter=args.use_alter)
+    mig_sql, skip_sql = compare_and_generate_migration(src_tables_meta, tgt_tables_meta, "TABLE", use_alter=args.use_alter, src_enum_ddls=src_enum_ddls) # src_enum_ddls 전달 추가
     all_migration_sql.extend(mig_sql)
     all_skipped_sql.extend(skip_sql)
 
@@ -674,36 +726,33 @@ def main():
                         if not sql_content.strip():
                             continue # 실행할 내용 없으면 다음 블록으로
 
-                        # SQL 블록을 개별 문장으로 분리 (세미콜론 기준, 간단한 분리)
-                        # 주의: 문자열 내 세미콜론 등 복잡한 경우 완벽하지 않을 수 있음
-                        statements = [stmt.strip() for stmt in sql_content.split(';') if stmt.strip()]
+                        # SQL 블록 전체를 단일 문장으로 실행
+                        # (compare_and_generate_migration에서 이미 완전한 DDL 단위로 생성됨)
+                        if not sql_content.strip(): # 추가된 빈 블록 스킵
+                            continue
 
-                        print(f"--- Executing Block {i+1} ({len(statements)} statements) ---")
-                        # 각 문장 실행
-                        for j, statement in enumerate(statements):
-                            try:
-                                print(f"  Executing statement {j+1}: {statement[:100]}{'...' if len(statement) > 100 else ''}")
-                                cur.execute(statement)
-                            except psycopg2.Error as e:
-                                print(f"\nError executing statement {j+1} in block {i+1}:")
-                                print(f"  Statement: {statement}")
-                                print(f"  Error: {e}")
-                                print("Rolling back transaction...")
-                                tgt_conn.rollback()
-                                print("Transaction rolled back.")
-                                execution_successful = False
-                                break # 현재 블록의 나머지 문장 실행 중단
-                            except Exception as e:
-                                print(f"\nAn unexpected error occurred during statement {j+1} execution:")
-                                print(f"  Statement: {statement}")
-                                print(f"  Error: {e}")
-                                print("Rolling back transaction...")
-                                tgt_conn.rollback()
-                                print("Transaction rolled back.")
-                                execution_successful = False
-                                break # 현재 블록의 나머지 문장 실행 중단
-
-                        if not execution_successful:
+                        print(f"--- Executing Block {i+1} (1 statement) ---")
+                        try:
+                            # sql_content 전체를 실행
+                            print(f"  Executing statement 1: {sql_content[:100]}{'...' if len(sql_content) > 100 else ''}")
+                            cur.execute(sql_content)
+                        except psycopg2.Error as e:
+                            print(f"\nError executing block {i+1}:")
+                            print(f"  Block Content: {sql_content}")
+                            print(f"  Error: {e}")
+                            print("Rolling back transaction...")
+                            tgt_conn.rollback()
+                            print("Transaction rolled back.")
+                            execution_successful = False
+                            break # 오류 발생 시 전체 실행 중단
+                        except Exception as e:
+                            print(f"\nAn unexpected error occurred during block {i+1} execution:")
+                            print(f"  Block Content: {sql_content}")
+                            print(f"  Error: {e}")
+                            print("Rolling back transaction...")
+                            tgt_conn.rollback()
+                            print("Transaction rolled back.")
+                            execution_successful = False
                             break # 오류 발생 시 전체 실행 중단
 
                 # 모든 블록 및 문장이 성공적으로 실행된 경우에만 커밋

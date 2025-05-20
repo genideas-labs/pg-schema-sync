@@ -73,7 +73,7 @@ def fetch_enums_values(conn):
 
 # --- Table Metadata (컬럼 정보) 조회 ---
 def fetch_tables_metadata(conn):
-    """테이블별 컬럼 메타데이터(이름, 타입, Null여부, 기본값)를 조회합니다."""
+    """테이블별 컬럼 메타데이터(이름, 타입, Null여부, 기본값, identity, FK)를 조회합니다."""
     cur = conn.cursor()
     params = []
     query_str = """
@@ -89,42 +89,140 @@ def fetch_tables_metadata(conn):
     tables_metadata = {}
     table_names = [row[0] for row in cur.fetchall()]
 
+    # 전체 FK 정보 미리 조회
+    cur.execute("""
+    SELECT
+      tc.table_name,
+      kcu.column_name,
+      ccu.table_name AS foreign_table_name,
+      ccu.column_name AS foreign_column_name
+    FROM
+      information_schema.table_constraints AS tc
+      JOIN information_schema.key_column_usage AS kcu
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.constraint_column_usage AS ccu
+        ON ccu.constraint_name = tc.constraint_name
+       AND ccu.table_schema = tc.table_schema
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND tc.table_schema = 'public';
+    """)
+    fk_lookup = {}  # {(table, column): (ref_table, ref_column)}
+    for tbl, col, ref_tbl, ref_col in cur.fetchall():
+        fk_lookup[(tbl, col)] = {"table": ref_tbl, "column": ref_col}
+
+    # 테이블별 컬럼 조회
     for table_name in table_names:
         col_query = f"""
         SELECT column_name,
                data_type,
                is_nullable,
-               column_default
+               column_default,
+               is_identity
         FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = '{table_name}'
+        WHERE table_schema = 'public' AND table_name = %s
         ORDER BY ordinal_position;
         """
-        cur.execute(col_query)
+        cur.execute(col_query, (table_name,))
         columns = []
-        for col_name, data_type, is_nullable, col_default in cur.fetchall():
-            columns.append({
+        for col_name, data_type, is_nullable, col_default, is_identity in cur.fetchall():
+            col_data = {
                 'name': col_name,
                 'type': data_type,
                 'nullable': is_nullable == 'YES',
-                'default': col_default
-            })
+                'default': col_default,
+                'identity': is_identity == 'YES',
+            }
+            if (table_name, col_name) in fk_lookup:
+                col_data["foreign_key"] = fk_lookup[(table_name, col_name)]
+            columns.append(col_data)
         tables_metadata[table_name] = columns
+
     cur.close()
     return tables_metadata
+
 
 # --- Table DDL 생성 함수 (메타데이터 기반 - 필요 시 사용) ---
 def generate_create_table_ddl(table_name, columns):
     """컬럼 메타데이터로부터 CREATE TABLE DDL을 생성합니다."""
     col_defs = []
+    enum_ddls = []
+
     for col in columns:
-        col_def = f"{col['name']} {col['type']}"
-        if col['default'] is not None:
-            # 기본값에 타입 캐스팅이 포함될 수 있으므로 그대로 사용
-            col_def += f" DEFAULT {col['default']}"
-        if not col['nullable']:
-            col_def += " NOT NULL"
+        col_type = col['type']
+        is_identity = col.get("identity", False)
+        # col_type이 문자열이 아닐 수 있으므로 안전하게 처리
+        if isinstance(col_type, str) and col_type.upper() == 'USER-DEFINED':
+            if table_name in ("menu_item_opts_set_schema", "menu_item_opts_schema")  and col['name'] == "type":
+                col_type = "public.option_type"
+                enum_ddls.append(
+                    """DO $$
+                        BEGIN
+                            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'option_type') THEN
+                                CREATE TYPE public.option_type AS ENUM ('additional', 'substitution');
+                            END IF;
+                    END$$;"""
+                )
+            elif table_name == "menu" and col['name'] == "onboarding_status":
+                col_type = "public.p2_onboarding_status"
+                enum_ddls.append(
+                    """DO $$
+                        BEGIN
+                            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'p2_onboarding_status') THEN
+                                CREATE TYPE public.p2_onboarding_status AS ENUM ('NOT_STARTED', 'STEP1', 'STEP2', 'STEP3', 'COMPLETED');
+                            END IF;
+                    END$$;"""
+                )
+            elif table_name == "order_menu_items" or table_name == "order_payments" or table_name == "orders" and col['name'] == "status":
+                col_type = "public.order_status"
+                enum_ddls.append(
+                    """DO $$
+                        BEGIN
+                            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'order_status') THEN
+                                CREATE TYPE public.order_status AS ENUM ('new', 'accepted', 'canceled', 'banned', 'cooking', 'pickup', 'prepayment', 'done');
+                            END IF;
+                    END$$;"""
+                )
+
+        # ARRAY 타입 처리
+        if isinstance(col_type, str) and col_type.upper() == 'ARRAY':
+            col_type = 'text[]'
+
+        quoted_col_name = f'"{col["name"]}"'
+        col_def = f"{quoted_col_name} {col_type}"  # ✅ 여기도 col_type 사용함
+
+        if is_identity:
+            col_def = f'{quoted_col_name} BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY'
+        else:
+            col_def = f"{quoted_col_name} {col_type}"
+
+            if col.get("default") is not None:
+                col_def += f" DEFAULT {col['default']}"
+            if not col.get("nullable", True):
+                col_def += " NOT NULL"
+
+
         col_defs.append(col_def)
-    return f"CREATE TABLE public.{table_name} (\n    " + ",\n    ".join(col_defs) + "\n);"
+
+    table_ddl = f"CREATE TABLE public.{table_name} (\n    " + ",\n    ".join(col_defs) + "\n);"
+    return "\n\n".join(enum_ddls + [table_ddl])
+
+def generate_foreign_key_ddls(tables_metadata):
+    """모든 foreign key를 ALTER TABLE DDL로 생성"""
+    fk_ddls = []
+    for table_name, columns in tables_metadata.items():
+        for col in columns:
+            if "foreign_key" in col:
+                fk = col["foreign_key"]
+                constraint_name = f"{table_name}_{col['name']}_fkey"
+                ddl = (
+                    f'ALTER TABLE public."{table_name}" '
+                    f'ADD CONSTRAINT "{constraint_name}" '
+                    f'FOREIGN KEY ("{col["name"]}") '
+                    f'REFERENCES public."{fk["table"]}" ("{fk["column"]}");'
+                )
+                fk_ddls.append(ddl)
+    return fk_ddls
 
 # --- View DDL 조회 ---
 def fetch_views(conn):
@@ -330,7 +428,9 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                     #     else:
                     #         needs_recreate = True
                     #         break
-
+                    if src_col.get("foreign_key") != tgt_col.get("foreign_key"):
+                        are_different = True
+                        needs_recreate = True
             # ALTER 문 생성 (컬럼 추가/삭제) - needs_recreate가 False이고 use_alter=True일 때만
             if not needs_recreate and use_alter:
                 if cols_to_add:
@@ -393,6 +493,26 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
             if src_data[name] != tgt_data[name]:
                 are_different = True
                 ddl = src_data[name]
+        elif obj_type == "FOREIGN_KEY":
+            if name not in tgt_data:
+                are_different = True
+                ddl = src_data[name]
+            else:
+                src_ddl = normalize_sql(src_data[name])
+                tgt_ddl = normalize_sql(tgt_data[name])
+                if src_ddl != tgt_ddl:
+                    are_different = True
+                    ddl = src_data[name]
+
+            if are_different:
+                # ✅ DROP 없이 추가만 시도
+                migration_sql.append(f"-- FOREIGN_KEY {name} differs or missing. Adding.\n{ddl}\n")
+            else:
+                # 스킵 처리
+                commented = '\n'.join([f"-- {line}" for line in src_data[name].strip().splitlines()])
+                skipped_sql.append(f"-- FOREIGN_KEY {name} is up-to-date; skipping.\n{commented}\n")
+            
+            continue  # 👈 중복 방지를 위해 이후 공통 처리 블록 건너뜀
         else:
             # 나머지 타입 (View, Index, Sequence): 정규화된 DDL 비교
             src_ddl_norm = normalize_sql(src_data[name])
@@ -402,7 +522,10 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                 ddl = src_data[name] # 변경 시 소스 DDL 사용
 
         # 비교 결과에 따라 SQL 생성 (TABLE 타입은 위에서 처리됨)
-        if obj_type != "TABLE" and are_different:
+        if obj_type == "FOREIGN_KEY" and are_different:
+            # FOREIGN KEY는 DROP CONSTRAINT 없이 그냥 ADD CONSTRAINT만 시도
+            migration_sql.append(f"-- FOREIGN_KEY {name} differs or missing. Adding.\n{ddl}\n")
+        elif obj_type != "TABLE" and are_different:
             # TABLE 외 다른 타입이 다르거나, TABLE이 ALTER 불가하여 재 생성 필요한 경우
             action = "Recreating" if obj_type != "FUNCTION" else "Updating" # 함수는 Update로 표시 (DROP/CREATE 동일)
             migration_sql.append(f"-- {obj_type} {name} differs. {action}.\nDROP {obj_type.upper()} IF EXISTS public.{name} CASCADE;\n{ddl}\n")
@@ -497,6 +620,25 @@ def print_verification_report(src_objs, tgt_objs, obj_type):
     print(f"  Status: {status}")
     return is_synced
 
+def extract_foreign_keys(metadata):
+    """
+    { "table.col->ref_table.ref_col": DDL } 형태로 반환
+    """
+    fk_map = {}
+    for table_name, columns in metadata.items():
+        for col in columns:
+            fk = col.get("foreign_key")
+            if fk:
+                constraint_key = f"{table_name}.{col['name']}->{fk['table']}.{fk['column']}"
+                constraint_name = f"{table_name}_{col['name']}_fkey"
+                ddl = (
+                    f'ALTER TABLE public."{table_name}" '
+                    f'ADD CONSTRAINT "{constraint_name}" '
+                    f'FOREIGN KEY ("{col["name"]}") '
+                    f'REFERENCES public."{fk["table"]}" ("{fk["column"]}");'
+                )
+                fk_map[constraint_key] = ddl
+    return fk_map
 
 def main():
     # --- 커맨드라인 인수 파싱 ---
@@ -662,6 +804,18 @@ def main():
     print("Comparing Tables (Metadata)...")
     # use_alter 옵션 전달
     mig_sql, skip_sql = compare_and_generate_migration(src_tables_meta, tgt_tables_meta, "TABLE", use_alter=args.use_alter, src_enum_ddls=src_enum_ddls) # src_enum_ddls 전달 추가
+    all_migration_sql.extend(mig_sql)
+    all_skipped_sql.extend(skip_sql)
+    # 테이블 메타데이터를 기반으로 FK DDL 생성
+
+
+
+    print("Comparing Foreign Keys...")  # 👈 이 부분 추가
+
+    src_fk_map = extract_foreign_keys(src_tables_meta)
+    tgt_fk_map = extract_foreign_keys(tgt_tables_meta)
+
+    mig_sql, skip_sql = compare_and_generate_migration(src_fk_map, tgt_fk_map, "FOREIGN_KEY")
     all_migration_sql.extend(mig_sql)
     all_skipped_sql.extend(skip_sql)
 

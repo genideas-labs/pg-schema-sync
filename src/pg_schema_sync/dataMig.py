@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 from psycopg2 import sql # SQL 식별자 안전 처리용
 import json
@@ -13,12 +12,12 @@ def get_connection(config):
     return conn
 SKIP_TABLES = {'slow_request_logs', 'member_action_log'}
 
-def migrate_single_table(src_conn, target_config, table_name, table_meta):
+def migrate_single_table(source_config, target_config, table_name, table_meta):
     
     try:
         print("Connecting to target database (gcp_test)...")
         tgt_conn = get_connection(target_config)
-
+        src_conn = get_connection(source_config)
         with src_conn.cursor() as src_cur, tgt_conn.cursor() as tgt_cur:
             print(f"  Migrating data for table: {table_name}")
             src_cur.execute(f'SELECT * FROM public."{table_name}"')
@@ -26,7 +25,7 @@ def migrate_single_table(src_conn, target_config, table_name, table_meta):
 
             if not rows:
                 print(f"    No data found in source {table_name}, skipping.")
-                return True
+                return True, None
 
             column_names = [desc[0] for desc in src_cur.description]
             quoted_column_names = [f'"{col}"' for col in column_names]
@@ -60,8 +59,10 @@ def migrate_single_table(src_conn, target_config, table_name, table_meta):
 
     except Exception as e:
         # 롤백하고 에러 리포트
+        print(f"  ❌ {table_name}: fail migrate")
         if tgt_conn and not tgt_conn.closed:
             tgt_conn.rollback()
+            src_conn.rollback()
         return False, str(e)
 
     finally:
@@ -69,6 +70,7 @@ def migrate_single_table(src_conn, target_config, table_name, table_meta):
         try:
             if tgt_conn and not tgt_conn.closed:
                 tgt_conn.close()
+                src_conn.close()
         except:
             pass
 
@@ -125,15 +127,17 @@ def run_data_migration_parallel(src_conn ,src_tables_meta, max_total_attempts=10
         print(f"An unexpected error occurred while reading config.yaml: {e}")
         return
     target_config = config['targets']['gcp_test']
+    source_config = config['source']
+
     
     for attempt in range(1, max_total_attempts + 1):
         print(f"\n=== Migration Attempt {attempt} ===")
         if not remaining_tables:
             break
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             future_to_table = {
-                executor.submit(migrate_single_table, src_conn, target_config, table_name, table_meta): table_name
+                executor.submit(migrate_single_table, source_config, target_config, table_name, table_meta): table_name
                 for table_name, table_meta in remaining_tables
             }
 
@@ -141,11 +145,11 @@ def run_data_migration_parallel(src_conn ,src_tables_meta, max_total_attempts=10
             for future in concurrent.futures.as_completed(future_to_table):
                 table_name = future_to_table[future]
                 try:
-                    success = future.result()
+                    success, error_msg = future.result()
                     if not success:
-                        table_meta = sorted_table_meta[table_name]  # ✅ meta를 다시 가져옴
+                        table_meta = sorted_table_meta[table_name]
                         next_round.append((table_name, table_meta))
-                        table_errors[table_name] = f"Failed on attempt {attempt}"
+                        table_errors[table_name] = error_msg or f"Failed on attempt {attempt}"
                 except Exception as exc:
                     table_meta = sorted_table_meta[table_name]
                     next_round.append((table_name, table_meta))
@@ -209,3 +213,20 @@ def batch_insert(tgt_conn, tgt_cur, insert_sql, serialized_rows, table_name, bat
             tgt_conn.rollback()
             print(f"    ❌ Batch {i // batch_size + 1}: Failed to insert {len(batch)} rows into {table_name}")
             print(f"       Error: {e}")
+
+def compare_row_counts(src_conn, tgt_conn, table_names):
+    """
+    src_conn, tgt_conn: psycopg2 커넥션
+    table_names: 비교할 테이블명 리스트
+    반환값: {table: (src_count, tgt_count)} 형태로, 차이가 있는 테이블만 담아서 리턴
+    """
+    diffs = {}
+    with src_conn.cursor() as src_cur, tgt_conn.cursor() as tgt_cur:
+        for tbl in table_names:
+            src_cur.execute(sql.SQL('SELECT COUNT(*) FROM public.{}').format(sql.Identifier(tbl)))
+            src_count = src_cur.fetchone()[0]
+            tgt_cur.execute(sql.SQL('SELECT COUNT(*) FROM public.{}').format(sql.Identifier(tbl)))
+            tgt_count = tgt_cur.fetchone()[0]
+            if src_count != tgt_count:
+                diffs[tbl] = (src_count, tgt_count)
+    return diffs

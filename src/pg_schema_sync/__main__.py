@@ -478,16 +478,84 @@ def fetch_indexes(conn):
 def fetch_sequences(conn):
     """시퀀스 DDL을 조회합니다."""
     cur = conn.cursor()
+    
+    # 시퀀스 목록 조회
     query = """
-    SELECT sequence_name,
-           'CREATE SEQUENCE public.' || sequence_name || ';' AS ddl
-    FROM information_schema.sequences
-    WHERE sequence_schema = 'public';
+    SELECT 
+        c.relname as sequence_name
+    FROM pg_class c 
+    JOIN pg_namespace n ON c.relnamespace = n.oid 
+    WHERE n.nspname = 'public' AND c.relkind = 'S'
+    ORDER BY c.relname;
     """
     cur.execute(query)
-    sequences = {seq_name: ddl for seq_name, ddl in cur.fetchall()}
+    rows = cur.fetchall()
+    
+    sequences = {}
+    
+    for row in rows:
+        seq_name = row[0]
+        
+        # 시퀀스의 현재 값 확인
+        try:
+            cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+            current_last_value, current_is_called = cur.fetchone()
+        except Exception as e:
+            print(f"Warning: Could not fetch current value for sequence {seq_name}: {e}")
+            current_last_value, current_is_called = None, False
+        
+        # 기본 CREATE SEQUENCE DDL 생성
+        ddl_parts = [f"CREATE SEQUENCE public.{seq_name}"]
+        
+        # 현재 값 설정 (시퀀스가 이미 사용된 경우)
+        if current_is_called and current_last_value is not None:
+            ddl_parts.append(f"RESTART WITH {current_last_value}")
+        
+        ddl = " ".join(ddl_parts) + ";"
+        sequences[seq_name] = ddl
+    
     cur.close()
     return sequences
+
+def sync_sequence_values(src_conn, tgt_conn, sequence_names):
+    """시퀀스의 현재 값을 소스에서 타겟으로 동기화합니다."""
+    print("\n--- Syncing Sequence Values ---")
+    
+    with src_conn.cursor() as src_cur, tgt_conn.cursor() as tgt_cur:
+        for seq_name in sequence_names:
+            try:
+                # 소스 시퀀스의 현재 값 조회
+                src_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+                src_last_value, src_is_called = src_cur.fetchone()
+                
+                # 타겟 시퀀스의 현재 값 조회
+                tgt_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+                tgt_last_value, tgt_is_called = tgt_cur.fetchone()
+                
+                print(f"  📊 {seq_name}:")
+                print(f"    Source: last_value={src_last_value}, is_called={src_is_called}")
+                print(f"    Target: last_value={tgt_last_value}, is_called={tgt_is_called}")
+                
+                # 값이 다른 경우에만 업데이트
+                if src_last_value != tgt_last_value:
+                    # 시퀀스 값을 소스와 동일하게 설정
+                    setval_sql = f"SELECT setval('public.{seq_name}', {src_last_value}, {src_is_called})"
+                    print(f"    Executing: {setval_sql}")
+                    tgt_cur.execute(setval_sql)
+                    
+                    # 업데이트 후 값 확인
+                    tgt_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+                    new_tgt_last_value, new_tgt_is_called = tgt_cur.fetchone()
+                    print(f"    After setval: last_value={new_tgt_last_value}, is_called={new_tgt_is_called}")
+                    
+                    print(f"  ✅ {seq_name}: {tgt_last_value} → {src_last_value}")
+                else:
+                    print(f"  ⏭️  {seq_name}: already synced ({src_last_value})")
+                    
+            except Exception as e:
+                print(f"  ❌ {seq_name}: failed to sync - {e}")
+                import traceback
+                traceback.print_exc()
 
 # --- 안전한 타입 변경 판단 함수 ---
 def is_safe_type_change(old_type, new_type):
@@ -747,6 +815,26 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                 skipped_sql.append(f"-- FOREIGN_KEY {name} is up-to-date; skipping.\n{commented}\n")
             
             continue  # 👈 중복 방지를 위해 이후 공통 처리 블록 건너뜀
+        elif obj_type == "SEQUENCE": # 양쪽에 있는 Sequence 처리
+            # 시퀀스가 테이블에서 사용 중일 수 있으므로 DROP 대신 ALTER 사용
+            src_ddl_norm = normalize_sql(src_data[name])
+            tgt_ddl_norm = normalize_sql(tgt_data[name])
+            if src_ddl_norm != tgt_ddl_norm:
+                # RESTART WITH 값만 추출하여 ALTER SEQUENCE 사용
+                restart_match = re.search(r'RESTART WITH (\d+)', src_data[name])
+                if restart_match:
+                    restart_value = restart_match.group(1)
+                    ddl = f"ALTER SEQUENCE public.{name} RESTART WITH {restart_value};"
+                    migration_sql.append(f"-- ALTER SEQUENCE {name} to sync current value\n{ddl}\n")
+                else:
+                    # RESTART WITH가 없으면 기본 CREATE SEQUENCE 사용
+                    ddl = src_data[name]
+                    migration_sql.append(f"-- SEQUENCE {name} differs. Recreating.\nDROP SEQUENCE IF EXISTS public.{name} CASCADE;\n{ddl}\n")
+            else:
+                # 동일한 경우 스킵
+                commented = '\n'.join([f"-- {line}" for line in src_data[name].strip().splitlines()])
+                skipped_sql.append(f"-- SEQUENCE {name} is up-to-date; skipping.\n{commented}\n")
+            continue  # 중복 방지를 위해 이후 공통 처리 블록 건너뜀
         else:
             # 나머지 타입 (View, Index, Sequence): 정규화된 DDL 비교
             src_ddl_norm = normalize_sql(src_data[name])
@@ -986,8 +1074,12 @@ def main():
     tgt_indexes, tgt_pkey_indexes = fetch_indexes(tgt_conn) # 비교용 + 정보용
 
     print("Fetching Sequence DDLs...")
+    print("  Fetching from source database...")
     src_sequences = fetch_sequences(src_conn) # 비교 및 DDL 생성용
+    print("  Fetching from target database...")
     tgt_sequences = fetch_sequences(tgt_conn) # 비교용
+    print(f"  Source sequences count: {len(src_sequences)}")
+    print(f"  Target sequences count: {len(tgt_sequences)}")
     # --- 데이터 조회 끝 ---
 
 
@@ -1113,6 +1205,13 @@ def main():
             run_data_migration_parallel(src_conn ,src_tables_meta)
             print("\nData migration completed and committed.")
 
+            # 시퀀스 값 동기화 실행 (데이터 마이그레이션 후)
+            common_sequences = set(src_sequences.keys()) & set(tgt_sequences.keys())
+            if common_sequences:
+                sync_sequence_values(src_conn, tgt_conn, common_sequences)
+                tgt_conn.commit()
+                print("Sequence values synchronized and committed.")
+
             # 검증: 모든 테이블의 row count 비교
             table_list = list(src_tables_meta.keys())
             diffs = compare_row_counts(src_conn, tgt_conn, table_list)
@@ -1179,9 +1278,27 @@ def main():
                 if execution_successful:
                     tgt_conn.commit()
                     print("\nMigration SQL executed successfully and committed.")
+                    
+                    # 시퀀스 값 동기화 실행
+                    common_sequences = set(src_sequences.keys()) & set(tgt_sequences.keys())
+                    print(f"\n--- Sequence Sync Debug ---")
+                    print(f"Source sequences: {list(src_sequences.keys())}")
+                    print(f"Target sequences: {list(tgt_sequences.keys())}")
+                    print(f"Common sequences: {list(common_sequences)}")
+                    
+                    if common_sequences:
+                        print(f"Calling sync_sequence_values with {len(common_sequences)} sequences...")
+                        sync_sequence_values(src_conn, tgt_conn, common_sequences)
+                        tgt_conn.commit()
+                        print("Sequence values synchronized and committed.")
+                    else:
+                        print("No common sequences found, skipping sequence sync.")
+                    
                     src_conn.close()
                     tgt_conn.close()
                     print("Connections closed.")
+                else:
+                    print("Migration SQL execution failed, skipping sequence sync.")
             except Exception as e: # 커서 생성 등 외부 try 블록의 예외 처리
                 print(f"\nAn unexpected error occurred during SQL execution setup: {e}")
                 print("Rolling back transaction...")

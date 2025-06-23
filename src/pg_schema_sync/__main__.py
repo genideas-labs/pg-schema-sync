@@ -6,7 +6,8 @@ import datetime # 타임스탬프용
 import os # 디렉토리 생성용
 import argparse # 커맨드라인 인수 처리용
 import re # SQL 정규화용
-
+from collections import defaultdict
+from dataMig import run_data_migration_parallel, compare_row_counts
 # --- 제외할 객체 목록 ---
 # Liquibase 등 마이그레이션 도구 관련 테이블 또는 기타 제외 대상
 EXCLUDE_TABLES = ['databasechangelog', 'databasechangeloglock']
@@ -72,59 +73,328 @@ def fetch_enums_values(conn):
     return enums_values
 
 # --- Table Metadata (컬럼 정보) 조회 ---
+# --- Table Metadata (컬럼 정보) 조회 ---
 def fetch_tables_metadata(conn):
-    """테이블별 컬럼 메타데이터(이름, 타입, Null여부, 기본값)를 조회합니다."""
     cur = conn.cursor()
-    params = []
-    query_str = """
+
+    # 1. 테이블 목록 가져오기
+    cur.execute("""
     SELECT table_name
     FROM information_schema.tables
-    WHERE table_schema = 'public' AND table_type='BASE TABLE'
-    """
-    if EXCLUDE_TABLES:
-        query_str += " AND table_name NOT IN %s"
-        params.append(tuple(EXCLUDE_TABLES))
-
-    cur.execute(query_str, params if params else None)
-    tables_metadata = {}
+    WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+    """)
     table_names = [row[0] for row in cur.fetchall()]
 
+    # 2. 제약조건 정보: FK / UNIQUE / PRIMARY
+    cur.execute("""
+    SELECT
+      tc.constraint_name,
+      tc.constraint_type,
+      tc.table_name,
+      kcu.column_name,
+      ccu.table_name AS foreign_table,
+      ccu.column_name AS foreign_column
+    FROM information_schema.table_constraints AS tc
+    LEFT JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+    LEFT JOIN information_schema.constraint_column_usage AS ccu
+      ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+    WHERE tc.table_schema = 'public';
+    """)
+
+    fk_lookup = {}
+    unique_col_flags = {}
+    primary_col_flags = {}
+    composite_uniques_temp = defaultdict(list)
+    composite_primaries_temp = defaultdict(list)
+
+    for constraint_name, constraint_type, table, column, ref_table, ref_col in cur.fetchall():
+        if constraint_type == 'FOREIGN KEY' and ref_table and ref_col:
+            fk_lookup[(table, column)] = {'table': ref_table, 'column': ref_col}
+        elif constraint_type == 'UNIQUE':
+            if column:
+                composite_uniques_temp[(table, constraint_name)].append(column)
+        elif constraint_type == 'PRIMARY KEY':
+            if column:
+                composite_primaries_temp[(table, constraint_name)].append(column)
+
+    for (table, constraint), cols in composite_uniques_temp.items():
+        if len(cols) == 1:
+            unique_col_flags[(table, cols[0])] = True
+        elif len(cols) > 1:
+            pass  # 복합 키는 나중에 처리
+
+    for (table, constraint), cols in composite_primaries_temp.items():
+        if len(cols) == 1:
+            primary_col_flags[(table, cols[0])] = True
+        elif len(cols) > 1:
+            pass  # 복합 키는 나중에 처리
+    
+    # 최종 composite 구조 생성
+    final_composite_uniques = defaultdict(list)
+    for (table, constraint_name), cols in composite_uniques_temp.items():
+        if len(cols) > 1:
+            # 중복 제거하면서 순서 유지
+            seen = set()
+            deduped = []
+            for c in cols:
+                if c not in seen:
+                    seen.add(c)
+                    deduped.append(c)
+            final_composite_uniques[table].append((constraint_name, deduped))
+
+    final_composite_primaries = {}
+    for (table, constraint_name), cols in composite_primaries_temp.items():
+        if len(cols) > 1:
+            # 중복 제거
+            seen = set()
+            deduped = []
+            for c in cols:
+                if c not in seen:
+                    seen.add(c)
+                    deduped.append(c)
+            final_composite_primaries[table] = deduped
+
+    # 3. 컬럼 정보 수집
+    tables_metadata = {}
     for table_name in table_names:
-        col_query = f"""
-        SELECT column_name,
-               data_type,
-               is_nullable,
-               column_default
+        cur.execute("""
+        SELECT column_name, data_type, is_nullable, udt_name, column_default, is_identity
         FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = '{table_name}'
+        WHERE table_schema = 'public' AND table_name = %s
         ORDER BY ordinal_position;
-        """
-        cur.execute(col_query)
+        """, (table_name,))
+
         columns = []
-        for col_name, data_type, is_nullable, col_default in cur.fetchall():
-            columns.append({
+        for col_name, data_type, is_nullable, udt_name, col_default, is_identity in cur.fetchall():
+            col_type = data_type
+            if data_type == 'ARRAY':
+                base_type = udt_name.lstrip('_')
+                col_type = base_type + '[]'
+
+            col_data = {
                 'name': col_name,
-                'type': data_type,
+                'type': col_type,
                 'nullable': is_nullable == 'YES',
-                'default': col_default
-            })
+                'default': col_default,
+                'identity': is_identity == 'YES'
+            }
+            if (table_name, col_name) in fk_lookup:
+                col_data['foreign_key'] = fk_lookup[(table_name, col_name)]
+            if (table_name, col_name) in unique_col_flags:
+                col_data['unique'] = True
+            if (table_name, col_name) in primary_col_flags:
+                col_data['primary_key'] = True
+
+            columns.append(col_data)
+
         tables_metadata[table_name] = columns
+
     cur.close()
-    return tables_metadata
+    return tables_metadata, final_composite_uniques, final_composite_primaries
+
+# def fetch_tables_metadata(conn):
+#     """테이블별 컬럼 메타데이터(이름, 타입, Null여부, 기본값, identity, FK, UNIQUE)를 조회합니다."""
+#     cur = conn.cursor()
+#     params = []
+#     query_str = """
+#     SELECT table_name
+#     FROM information_schema.tables
+#     WHERE table_schema = 'public' AND table_type='BASE TABLE'
+#     """
+#     if EXCLUDE_TABLES:
+#         query_str += " AND table_name NOT IN %s"
+#         params.append(tuple(EXCLUDE_TABLES))
+
+#     cur.execute(query_str, params if params else None)
+#     tables_metadata = {}
+#     table_names = [row[0] for row in cur.fetchall()]
+
+#     fk_lookup = {}
+#     unique_lookup = set()
+#     pk_lookup = set()
+
+#     # 전체 FK 정보 미리 조회
+#     cur.execute("""
+#     SELECT
+#     tc.constraint_type,
+#         tc.table_name,
+#         kcu.column_name,
+#         ccu.table_name AS foreign_table_name,
+#         ccu.column_name AS foreign_column_name
+#     FROM information_schema.table_constraints AS tc
+#     LEFT JOIN information_schema.key_column_usage AS kcu
+#         ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+#     LEFT JOIN information_schema.constraint_column_usage AS ccu
+#         ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+#     WHERE tc.table_schema = 'public';
+#     """)
+
+
+#     for constraint_type, table_name, column_name, ref_table, ref_column in cur.fetchall():
+#         if not column_name:
+#             continue  # 복합 키의 일부가 아닐 수 있음
+#         if constraint_type == 'FOREIGN KEY' and ref_table and ref_column:
+#             fk_lookup[(table_name, column_name)] = {"table": ref_table, "column": ref_column}
+#         elif constraint_type == 'UNIQUE':
+#             unique_lookup.add((table_name, column_name))
+#         elif constraint_type == 'PRIMARY KEY':
+#             pk_lookup.add((table_name, column_name))
+
+
+#     # 테이블별 컬럼 조회
+#     for table_name in table_names:
+#         col_query = f"""
+#         SELECT column_name,
+#                data_type,
+#                is_nullable,
+#                udt_name,
+#                column_default,
+#                is_identity
+#         FROM information_schema.columns
+#         WHERE table_schema = 'public' AND table_name = %s
+#         ORDER BY ordinal_position;
+#         """
+#         cur.execute(col_query, (table_name,))
+#         columns = []
+#         for col_name, data_type, is_nullable, udt_name, col_default, is_identity in cur.fetchall():
+#             col_type = data_type
+#             if data_type == 'ARRAY':
+#                 base_type = udt_name.lstrip('_')
+#                 col_type = base_type + '[]' if base_type else 'text[]'  # fallback
+
+#             col_data = {
+#                 'name': col_name,
+#                 'type': col_type,
+#                 'nullable': is_nullable == 'YES',
+#                 'default': col_default,
+#                 'identity': is_identity == 'YES'
+#             }
+#             if (table_name, col_name) in fk_lookup:
+#                 col_data["foreign_key"] = fk_lookup[(table_name, col_name)]
+#             if (table_name, col_name) in unique_lookup:
+#                 col_data["unique"] = True
+#             if (table_name, col_name) in pk_lookup:
+#                 col_data["primary_key"] = True  # ✅ 여기에 추가
+#             columns.append(col_data)
+#         tables_metadata[table_name] = columns
+
+#     cur.close()
+#     return tables_metadata
+
+
 
 # --- Table DDL 생성 함수 (메타데이터 기반 - 필요 시 사용) ---
-def generate_create_table_ddl(table_name, columns):
-    """컬럼 메타데이터로부터 CREATE TABLE DDL을 생성합니다."""
+def generate_create_table_ddl(table_name, columns, 
+                              composite_uniques=None, 
+                              composite_primaries=None):
+    """컬럼 메타데이터와 복합 제약 조건으로 CREATE TABLE DDL 생성"""
+    composite_uniques = composite_uniques or {}
+    composite_primaries = composite_primaries or {}
+
     col_defs = []
+    table_constraints = []
+    enum_ddls = []
+
     for col in columns:
-        col_def = f"{col['name']} {col['type']}"
-        if col['default'] is not None:
-            # 기본값에 타입 캐스팅이 포함될 수 있으므로 그대로 사용
-            col_def += f" DEFAULT {col['default']}"
-        if not col['nullable']:
-            col_def += " NOT NULL"
+        col_type = col['type']
+        quoted_col_name = f'"{col["name"]}"'
+
+        # 사용자 정의 enum 타입 처리
+        if isinstance(col_type, str) and col_type.upper() == 'USER-DEFINED':
+            if table_name in ("menu_item_opts_set_schema", "menu_item_opts_schema") and col['name'] == "type":
+                col_type = "public.option_type"
+                enum_ddls.append(
+                    """DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'option_type') THEN
+    CREATE TYPE public.option_type AS ENUM ('additional', 'substitution');
+  END IF;
+END$$;"""
+                )
+            elif table_name == "menu" and col['name'] == "onboarding_status":
+                col_type = "public.p2_onboarding_status"
+                enum_ddls.append(
+                    """DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'p2_onboarding_status') THEN
+    CREATE TYPE public.p2_onboarding_status AS ENUM ('NOT_STARTED', 'STEP1', 'STEP2', 'STEP3', 'COMPLETED');
+  END IF;
+END$$;"""
+                )
+            elif table_name in {"order_menu_items", "order_payments", "orders"} and col['name'] == "status":
+                col_type = "public.order_status"
+                enum_ddls.append(
+                    """DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'order_status') THEN
+    CREATE TYPE public.order_status AS ENUM ('new', 'accepted', 'canceled', 'banned', 'cooking', 'pickup', 'prepayment', 'done');
+  END IF;
+END$$;"""
+                )
+
+        # ✅ inline 컬럼 정의 처리
+        is_identity = col.get("identity", False)
+        is_primary = col.get("primary_key", False)
+        is_unique = col.get("unique", False)
+        is_nullable = col.get("nullable", True)
+        default_val = col.get("default")
+
+        if is_identity and is_primary:
+            col_def = f'{quoted_col_name} BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY'
+        else:
+            col_def = f"{quoted_col_name} {col_type}"
+            if is_identity:
+                col_def += " GENERATED BY DEFAULT AS IDENTITY"
+            if default_val is not None:
+                col_def += f" DEFAULT {default_val}"
+            if not is_nullable:
+                col_def += " NOT NULL"
+            if is_unique:
+                col_def += " UNIQUE"
+            if is_primary:
+                col_def += " PRIMARY KEY"
+
         col_defs.append(col_def)
-    return f"CREATE TABLE public.{table_name} (\n    " + ",\n    ".join(col_defs) + "\n);"
+    print("composite_uniques",composite_uniques)
+    # ✅ 복합 UNIQUE 제약조건
+    if table_name in composite_uniques:
+        for constraint_name, cols in composite_uniques[table_name]:
+            quoted_cols = ", ".join(f'"{c}"' for c in cols)
+            table_constraints.append(
+                f'CONSTRAINT "{constraint_name}" UNIQUE ({quoted_cols})'
+            )
+
+    # ✅ 복합 PRIMARY KEY 제약조건
+    if table_name in composite_primaries:
+        cols = composite_primaries[table_name]
+        quoted_cols = ", ".join(f'"{col}"' for col in cols)
+        constraint_name = f"{table_name}_pkey"
+        table_constraints.append(f'CONSTRAINT {constraint_name} PRIMARY KEY ({quoted_cols})')
+    print("table_constraints",table_constraints)
+    # 전체 CREATE TABLE DDL
+    all_defs = col_defs + table_constraints
+    table_ddl = f'CREATE TABLE public."{table_name}" (\n    ' + ",\n    ".join(all_defs) + "\n);"
+
+    return "\n\n".join(enum_ddls + [table_ddl])
+
+
+# def generate_foreign_key_ddls(tables_metadata):
+#     """모든 foreign key를 ALTER TABLE DDL로 생성"""
+#     fk_ddls = []
+#     for table_name, columns in tables_metadata.items():
+#         for col in columns:
+#             if "foreign_key" in col:
+#                 fk = col["foreign_key"]
+#                 constraint_name = f"{table_name}_{col['name']}_fkey"
+#                 ddl = (
+#                     f'ALTER TABLE public."{table_name}" '
+#                     f'ADD CONSTRAINT "{constraint_name}" '
+#                     f'FOREIGN KEY ("{col["name"]}") '
+#                     f'REFERENCES public."{fk["table"]}" ("{fk["column"]}");'
+#                 )
+#                 fk_ddls.append(ddl)
+#     return fk_ddls
 
 # --- View DDL 조회 ---
 def fetch_views(conn):
@@ -168,48 +438,124 @@ def fetch_functions(conn):
 
 # --- Index DDL 조회 (기본 키 인덱스 분리) ---
 def fetch_indexes(conn):
-    """인덱스 DDL을 조회하되, 기본 키(_pkey) 인덱스를 분리하여 반환합니다."""
+    """인덱스 DDL을 조회하되, UNIQUE/PRIMARY KEY 제약조건으로 생성된 인덱스는 제외합니다."""
     cur = conn.cursor()
-    params = []
-    # EXCLUDE_INDEXES 목록에 있는 것만 제외하고 일단 모두 조회
-    query_str = """
+
+    # 1. constraint에서 생성된 인덱스 이름들 수집
+    cur.execute("""
+    SELECT conname
+    FROM pg_constraint
+    WHERE contype IN ('u', 'p')  -- UNIQUE or PRIMARY KEY
+      AND connamespace = 'public'::regnamespace;
+    """)
+    constraint_index_names = {row[0] for row in cur.fetchall()}
+
+    # 2. pg_indexes에서 일반 인덱스 조회
+    cur.execute("""
     SELECT indexname,
-           indexdef as ddl
+           indexdef
     FROM pg_indexes
-    WHERE schemaname = 'public'
-    """
-    if EXCLUDE_INDEXES:
-        query_str += " AND indexname NOT IN %s"
-        params.append(tuple(EXCLUDE_INDEXES))
+    WHERE schemaname = 'public';
+    """)
 
-    cur.execute(query_str, params if params else None)
-
-    indexes = {} # 비교 대상 인덱스
-    pkey_indexes = {} # 기본 키 인덱스 (정보용)
+    indexes = {}
+    pkey_indexes = {}
 
     for indexname, ddl in cur.fetchall():
+        if indexname in constraint_index_names:
+            # ✅ UNIQUE/PK constraint에서 유래한 인덱스는 무시
+            continue
         if indexname.endswith('_pkey'):
             pkey_indexes[indexname] = ddl
         else:
             indexes[indexname] = ddl
 
     cur.close()
-    return indexes, pkey_indexes # 두 개의 딕셔너리 반환
+    return indexes, pkey_indexes
+
 
 # --- Sequence DDL 조회 ---
 def fetch_sequences(conn):
     """시퀀스 DDL을 조회합니다."""
     cur = conn.cursor()
+    
+    # 시퀀스 목록 조회
     query = """
-    SELECT sequence_name,
-           'CREATE SEQUENCE public.' || sequence_name || ';' AS ddl
-    FROM information_schema.sequences
-    WHERE sequence_schema = 'public';
+    SELECT 
+        c.relname as sequence_name
+    FROM pg_class c 
+    JOIN pg_namespace n ON c.relnamespace = n.oid 
+    WHERE n.nspname = 'public' AND c.relkind = 'S'
+    ORDER BY c.relname;
     """
     cur.execute(query)
-    sequences = {seq_name: ddl for seq_name, ddl in cur.fetchall()}
+    rows = cur.fetchall()
+    
+    sequences = {}
+    
+    for row in rows:
+        seq_name = row[0]
+        
+        # 시퀀스의 현재 값 확인
+        try:
+            cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+            current_last_value, current_is_called = cur.fetchone()
+        except Exception as e:
+            print(f"Warning: Could not fetch current value for sequence {seq_name}: {e}")
+            current_last_value, current_is_called = None, False
+        
+        # 기본 CREATE SEQUENCE DDL 생성
+        ddl_parts = [f"CREATE SEQUENCE public.{seq_name}"]
+        
+        # 현재 값 설정 (시퀀스가 이미 사용된 경우)
+        if current_is_called and current_last_value is not None:
+            ddl_parts.append(f"RESTART WITH {current_last_value}")
+        
+        ddl = " ".join(ddl_parts) + ";"
+        sequences[seq_name] = ddl
+    
     cur.close()
     return sequences
+
+def sync_sequence_values(src_conn, tgt_conn, sequence_names):
+    """시퀀스의 현재 값을 소스에서 타겟으로 동기화합니다."""
+    print("\n--- Syncing Sequence Values ---")
+    
+    with src_conn.cursor() as src_cur, tgt_conn.cursor() as tgt_cur:
+        for seq_name in sequence_names:
+            try:
+                # 소스 시퀀스의 현재 값 조회
+                src_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+                src_last_value, src_is_called = src_cur.fetchone()
+                
+                # 타겟 시퀀스의 현재 값 조회
+                tgt_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+                tgt_last_value, tgt_is_called = tgt_cur.fetchone()
+                
+                print(f"  📊 {seq_name}:")
+                print(f"    Source: last_value={src_last_value}, is_called={src_is_called}")
+                print(f"    Target: last_value={tgt_last_value}, is_called={tgt_is_called}")
+                
+                # 값이 다른 경우에만 업데이트
+                if src_last_value != tgt_last_value:
+                    # 시퀀스 값을 소스와 동일하게 설정
+                    setval_sql = f"SELECT setval('public.{seq_name}', {src_last_value}, {src_is_called})"
+                    print(f"    Executing: {setval_sql}")
+                    tgt_cur.execute(setval_sql)
+                    
+                    # 업데이트 후 값 확인
+                    tgt_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+                    new_tgt_last_value, new_tgt_is_called = tgt_cur.fetchone()
+                    print(f"    After setval: last_value={new_tgt_last_value}, is_called={new_tgt_is_called}")
+                    
+                    print(f"  ✅ {seq_name}: {tgt_last_value} → {src_last_value}")
+                else:
+                    print(f"  ⏭️  {seq_name}: already synced ({src_last_value})")
+                    
+            except Exception as e:
+                print(f"  ❌ {seq_name}: failed to sync - {e}")
+                import traceback
+                traceback.print_exc()
 
 # --- 안전한 타입 변경 판단 함수 ---
 def is_safe_type_change(old_type, new_type):
@@ -242,7 +588,9 @@ def is_safe_type_change(old_type, new_type):
     return False # 그 외는 안전하지 않음으로 간주
 
 # --- 비교 후 migration SQL 생성 (타입별 로직 분기, Enum DDL 참조 추가, ALTER TABLE 지원 추가) ---
-def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=None, use_alter=False):
+def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=None, use_alter=False,
+                                 src_composite_uniques=None, tgt_composite_uniques=None,
+                                 src_composite_primaries=None, tgt_composite_primaries=None):
     """
     소스와 타겟 데이터를 비교하여 마이그레이션 SQL과 건너뛴 SQL을 생성합니다.
     obj_type에 따라 비교 방식을 다르게 적용합니다.
@@ -258,11 +606,29 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
     # 소스에만 있는 객체 처리
     for name in src_keys - tgt_keys:
         if obj_type == "TABLE":
-            ddl = generate_create_table_ddl(name, src_data[name])
+            ddl = generate_create_table_ddl(
+                        name,
+                        src_data[name],
+                        composite_uniques=src_composite_uniques,
+                        composite_primaries=src_composite_primaries
+                        )
+
         elif obj_type == "TYPE": # 소스에만 있는 Enum 처리
             ddl = src_enum_ddls.get(name, f"-- ERROR: DDL not found for Enum {name}")
         elif obj_type == "SEQUENCE": # 소스에만 있는 Sequence 처리
             ddl = src_data.get(name, f"-- ERROR: DDL not found for Sequence {name}")
+        elif obj_type == "INDEX":
+            raw_ddl = src_data.get(name, f"-- ERROR: DDL not found for Index {name}")
+            ddl = f"""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = '{name}'
+                        ) THEN
+                            {raw_ddl};
+                        END IF;
+                    END$$;
+                    """.strip()    
         else: # View, Function, Index 등
             ddl = src_data.get(name, f"-- ERROR: DDL not found for {obj_type} {name}")
         migration_sql.append(f"-- CREATE {obj_type} {name}\n{ddl}\n")
@@ -323,14 +689,6 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                              needs_recreate = True
                              break
 
-                    # 3. 기본값 변경 확인 (현재 로직에서는 비교 안 함, 필요시 추가)
-                    # if normalize_sql(str(src_col.get('default',''))) != normalize_sql(str(tgt_col.get('default',''))):
-                    #     if use_alter:
-                    #         # ALTER DEFAULT 추가/변경/삭제 로직
-                    #     else:
-                    #         needs_recreate = True
-                    #         break
-
             # ALTER 문 생성 (컬럼 추가/삭제) - needs_recreate가 False이고 use_alter=True일 때만
             if not needs_recreate and use_alter:
                 if cols_to_add:
@@ -366,7 +724,13 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
             # needs_recreate가 True이면 무조건 재 생성
             if needs_recreate:
                 are_different = True
-                ddl = generate_create_table_ddl(name, src_data[name]) # 재 생성 DDL 준비
+                ddl = generate_create_table_ddl(
+                    name,
+                    src_data[name],
+                    composite_uniques=src_composite_uniques,
+                        composite_primaries=src_composite_primaries
+                )
+
                 alter_statements = [] # ALTER 문은 무시
             # use_alter=False 이고 컬럼 구성이 다르면 재 생성
             elif not use_alter and (len(src_cols_map) != len(tgt_cols_map) or \
@@ -375,12 +739,50 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                                         sc['nullable'] != tc['nullable']
                                         for sc, tc in zip(src_data[name], tgt_data[name]))):
                  are_different = True
-                 ddl = generate_create_table_ddl(name, src_data[name]) # 재 생성 DDL 준비
+                 ddl = generate_create_table_ddl(
+                        name,
+                        src_data[name],
+                        composite_uniques=src_composite_uniques,
+                        composite_primaries=src_composite_primaries
+                        )
+
                  alter_statements = [] # ALTER 문은 무시
             elif not alter_statements:
                  # 재 생성 필요 없고, ALTER 문도 없으면 변경 없음
                  are_different = False
-
+        elif obj_type == "INDEX":
+            if name not in tgt_data:
+                ddl = src_data[name]
+                ddl = f"""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = '{name}'
+                            ) THEN
+                                {ddl};
+                            END IF;
+                        END$$;
+                        """.strip()
+                migration_sql.append(f"-- INDEX {name} differs or missing. Adding.\n{ddl}\n")
+                continue
+            else:
+                if normalize_sql(src_data[name]) != normalize_sql(tgt_data[name]):
+                    ddl = src_data[name]
+                    ddl = f"""
+                            DO $$
+                            BEGIN
+                                IF NOT EXISTS (
+                                    SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = '{name}'
+                                ) THEN
+                                    {ddl};
+                                END IF;
+                            END$$;
+                            """.strip()
+                    migration_sql.append(f"-- INDEX {name} differs. Replacing.\n{ddl}\n")
+                else:
+                    commented = '\n'.join([f"-- {line}" for line in src_data[name].strip().splitlines()])
+                    skipped_sql.append(f"-- INDEX {name} is up-to-date; skipping.\n{commented}\n")
+                continue
         elif obj_type == "TYPE": # Enum 타입 가정
             src_values = src_data[name]
             tgt_values = tgt_data[name]
@@ -393,6 +795,46 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
             if src_data[name] != tgt_data[name]:
                 are_different = True
                 ddl = src_data[name]
+        elif obj_type == "FOREIGN_KEY":
+            if name not in tgt_data:
+                are_different = True
+                ddl = src_data[name]
+            else:
+                src_ddl = normalize_sql(src_data[name])
+                tgt_ddl = normalize_sql(tgt_data[name])
+                if src_ddl != tgt_ddl:
+                    are_different = True
+                    ddl = src_data[name]
+
+            if are_different:
+                # ✅ DROP 없이 추가만 시도
+                migration_sql.append(f"-- FOREIGN_KEY {name} differs or missing. Adding.\n{ddl}\n")
+            else:
+                # 스킵 처리
+                commented = '\n'.join([f"-- {line}" for line in src_data[name].strip().splitlines()])
+                skipped_sql.append(f"-- FOREIGN_KEY {name} is up-to-date; skipping.\n{commented}\n")
+            
+            continue  # 👈 중복 방지를 위해 이후 공통 처리 블록 건너뜀
+        elif obj_type == "SEQUENCE": # 양쪽에 있는 Sequence 처리
+            # 시퀀스가 테이블에서 사용 중일 수 있으므로 DROP 대신 ALTER 사용
+            src_ddl_norm = normalize_sql(src_data[name])
+            tgt_ddl_norm = normalize_sql(tgt_data[name])
+            if src_ddl_norm != tgt_ddl_norm:
+                # RESTART WITH 값만 추출하여 ALTER SEQUENCE 사용
+                restart_match = re.search(r'RESTART WITH (\d+)', src_data[name])
+                if restart_match:
+                    restart_value = restart_match.group(1)
+                    ddl = f"ALTER SEQUENCE public.{name} RESTART WITH {restart_value};"
+                    migration_sql.append(f"-- ALTER SEQUENCE {name} to sync current value\n{ddl}\n")
+                else:
+                    # RESTART WITH가 없으면 기본 CREATE SEQUENCE 사용
+                    ddl = src_data[name]
+                    migration_sql.append(f"-- SEQUENCE {name} differs. Recreating.\nDROP SEQUENCE IF EXISTS public.{name} CASCADE;\n{ddl}\n")
+            else:
+                # 동일한 경우 스킵
+                commented = '\n'.join([f"-- {line}" for line in src_data[name].strip().splitlines()])
+                skipped_sql.append(f"-- SEQUENCE {name} is up-to-date; skipping.\n{commented}\n")
+            continue  # 중복 방지를 위해 이후 공통 처리 블록 건너뜀
         else:
             # 나머지 타입 (View, Index, Sequence): 정규화된 DDL 비교
             src_ddl_norm = normalize_sql(src_data[name])
@@ -402,7 +844,10 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                 ddl = src_data[name] # 변경 시 소스 DDL 사용
 
         # 비교 결과에 따라 SQL 생성 (TABLE 타입은 위에서 처리됨)
-        if obj_type != "TABLE" and are_different:
+        if obj_type == "FOREIGN_KEY" and are_different:
+            # FOREIGN KEY는 DROP CONSTRAINT 없이 그냥 ADD CONSTRAINT만 시도
+            migration_sql.append(f"-- FOREIGN_KEY {name} differs or missing. Adding.\n{ddl}\n")
+        elif obj_type != "TABLE" and are_different:
             # TABLE 외 다른 타입이 다르거나, TABLE이 ALTER 불가하여 재 생성 필요한 경우
             action = "Recreating" if obj_type != "FUNCTION" else "Updating" # 함수는 Update로 표시 (DROP/CREATE 동일)
             migration_sql.append(f"-- {obj_type} {name} differs. {action}.\nDROP {obj_type.upper()} IF EXISTS public.{name} CASCADE;\n{ddl}\n")
@@ -413,7 +858,12 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
             # 동일한 경우: 스킵 처리
             original_ddl = ""
             if obj_type == "TABLE":
-                 original_ddl = generate_create_table_ddl(name, src_data[name])
+                 original_ddl = generate_create_table_ddl(
+                        name,
+                        src_data[name],
+                        composite_uniques=src_composite_uniques,
+                        composite_primaries=src_composite_primaries
+                        )
             elif obj_type == "TYPE":
                  original_ddl = src_enum_ddls.get(name, "") # 스킵 로그용 Enum DDL
             else: # View, Function, Index, Sequence 등
@@ -497,6 +947,25 @@ def print_verification_report(src_objs, tgt_objs, obj_type):
     print(f"  Status: {status}")
     return is_synced
 
+def extract_foreign_keys(metadata):
+    """
+    { "table.col->ref_table.ref_col": DDL } 형태로 반환
+    """
+    fk_map = {}
+    for table_name, columns in metadata.items():
+        for col in columns:
+            fk = col.get("foreign_key")
+            if fk:
+                constraint_key = f"{table_name}.{col['name']}->{fk['table']}.{fk['column']}"
+                constraint_name = f"{table_name}_{col['name']}_fkey"
+                ddl = (
+                    f'ALTER TABLE public."{table_name}" '
+                    f'ADD CONSTRAINT "{constraint_name}" '
+                    f'FOREIGN KEY ("{col["name"]}") '
+                    f'REFERENCES public."{fk["table"]}" ("{fk["column"]}");'
+                )
+                fk_map[constraint_key] = ddl
+    return fk_map
 
 def main():
     # --- 커맨드라인 인수 파싱 ---
@@ -510,6 +979,8 @@ def main():
     # Experimental ALTER TABLE flag
     parser.add_argument('--use-alter', action='store_true', default=False,
                         help="EXPERIMENTAL: Use ALTER TABLE for column additions/deletions instead of DROP/CREATE. Use with caution.")
+    parser.add_argument('--with-data', action='store_true',
+                    help="Include data migration after schema changes")
     args = parser.parse_args()
     # --- 인수 파싱 끝 ---
 
@@ -586,8 +1057,9 @@ def main():
     tgt_enum_values = fetch_enums_values(tgt_conn) # 비교용
 
     print("Fetching Table Metadata...")
-    src_tables_meta = fetch_tables_metadata(src_conn) # 비교 및 DDL 생성용
-    tgt_tables_meta = fetch_tables_metadata(tgt_conn) # 비교용
+    src_tables_meta, src_composite_uniques, src_composite_primaries = fetch_tables_metadata(src_conn)
+    tgt_tables_meta, tgt_composite_uniques, tgt_composite_primaries = fetch_tables_metadata(tgt_conn)
+
 
     print("Fetching View DDLs...")
     src_views = fetch_views(src_conn) # 비교 및 DDL 생성용
@@ -602,8 +1074,12 @@ def main():
     tgt_indexes, tgt_pkey_indexes = fetch_indexes(tgt_conn) # 비교용 + 정보용
 
     print("Fetching Sequence DDLs...")
+    print("  Fetching from source database...")
     src_sequences = fetch_sequences(src_conn) # 비교 및 DDL 생성용
+    print("  Fetching from target database...")
     tgt_sequences = fetch_sequences(tgt_conn) # 비교용
+    print(f"  Source sequences count: {len(src_sequences)}")
+    print(f"  Target sequences count: {len(tgt_sequences)}")
     # --- 데이터 조회 끝 ---
 
 
@@ -661,7 +1137,22 @@ def main():
 
     print("Comparing Tables (Metadata)...")
     # use_alter 옵션 전달
-    mig_sql, skip_sql = compare_and_generate_migration(src_tables_meta, tgt_tables_meta, "TABLE", use_alter=args.use_alter, src_enum_ddls=src_enum_ddls) # src_enum_ddls 전달 추가
+    mig_sql, skip_sql = compare_and_generate_migration(src_tables_meta, tgt_tables_meta, "TABLE", 
+                                                       use_alter=args.use_alter, src_enum_ddls=src_enum_ddls,
+                                                       src_composite_uniques = src_composite_uniques,tgt_composite_uniques= tgt_composite_uniques,
+                                                       src_composite_primaries = src_composite_primaries, tgt_composite_primaries = tgt_composite_primaries  ) # src_enum_ddls 전달 추가
+    all_migration_sql.extend(mig_sql)
+    all_skipped_sql.extend(skip_sql)
+    # 테이블 메타데이터를 기반으로 FK DDL 생성
+
+
+
+    print("Comparing Foreign Keys...")  # 👈 이 부분 추가
+
+    src_fk_map = extract_foreign_keys(src_tables_meta)
+    tgt_fk_map = extract_foreign_keys(tgt_tables_meta)
+
+    mig_sql, skip_sql = compare_and_generate_migration(src_fk_map, tgt_fk_map, "FOREIGN_KEY")
     all_migration_sql.extend(mig_sql)
     all_skipped_sql.extend(skip_sql)
 
@@ -682,9 +1173,7 @@ def main():
     all_skipped_sql.extend(skip_sql)
     # --- 비교 및 SQL 생성 끝 ---
 
-    # Source 연결은 여기서 닫아도 됨
-    src_conn.close()
-    print("Source connection closed.")
+    
 
     # 파일명 생성 (target_name은 config에서 가져온 첫번째 타겟 키로 가정)
     # TODO: 여러 타겟을 처리해야 하는 경우 로직 수정 필요
@@ -710,8 +1199,38 @@ def main():
     except IOError as e:
         print(f"Error writing skipped file {skipped_filename}: {e}")
 
+    if args.with_data:
+        print("\n-- Running only Data Migration --")
+        try:
+            run_data_migration_parallel(src_conn ,src_tables_meta)
+            print("\nData migration completed and committed.")
+
+            # 시퀀스 값 동기화 실행 (데이터 마이그레이션 후)
+            common_sequences = set(src_sequences.keys()) & set(tgt_sequences.keys())
+            if common_sequences:
+                sync_sequence_values(src_conn, tgt_conn, common_sequences)
+                tgt_conn.commit()
+                print("Sequence values synchronized and committed.")
+
+            # 검증: 모든 테이블의 row count 비교
+            table_list = list(src_tables_meta.keys())
+            diffs = compare_row_counts(src_conn, tgt_conn, table_list)
+            if diffs:
+                print("\n❗ Row count mismatches detected:")
+                for tbl, (src_cnt, tgt_cnt) in diffs.items():
+                    print(f"  - {tbl}: source={src_cnt}, target={tgt_cnt}")
+            else:
+                print("\n✅ All row counts match between source and target.")
+
+        except Exception as e:
+            print(f"Error during data migration: {e}")
+            print("Transaction rolled back.")
+        finally:
+            src_conn.close()
+            print("Connections closed.")
+        return  
     # --- 마이그레이션 SQL 실행 (commit 옵션이 True일 경우) ---
-    if args.commit:
+    elif args.commit:
         if not all_migration_sql:
             print("No migration SQL to execute.")
         else:
@@ -759,7 +1278,27 @@ def main():
                 if execution_successful:
                     tgt_conn.commit()
                     print("\nMigration SQL executed successfully and committed.")
-
+                    
+                    # 시퀀스 값 동기화 실행
+                    common_sequences = set(src_sequences.keys()) & set(tgt_sequences.keys())
+                    print(f"\n--- Sequence Sync Debug ---")
+                    print(f"Source sequences: {list(src_sequences.keys())}")
+                    print(f"Target sequences: {list(tgt_sequences.keys())}")
+                    print(f"Common sequences: {list(common_sequences)}")
+                    
+                    if common_sequences:
+                        print(f"Calling sync_sequence_values with {len(common_sequences)} sequences...")
+                        sync_sequence_values(src_conn, tgt_conn, common_sequences)
+                        tgt_conn.commit()
+                        print("Sequence values synchronized and committed.")
+                    else:
+                        print("No common sequences found, skipping sequence sync.")
+                    
+                    src_conn.close()
+                    tgt_conn.close()
+                    print("Connections closed.")
+                else:
+                    print("Migration SQL execution failed, skipping sequence sync.")
             except Exception as e: # 커서 생성 등 외부 try 블록의 예외 처리
                 print(f"\nAn unexpected error occurred during SQL execution setup: {e}")
                 print("Rolling back transaction...")
@@ -772,11 +1311,6 @@ def main():
                 print("Transaction rolled back.")
 
     # --- SQL 실행 끝 ---
-
-    # Target 연결 닫기 (SQL 실행 후)
-    if tgt_conn:
-        tgt_conn.close()
-        print("Target connection closed.")
 
 
 if __name__ == '__main__':

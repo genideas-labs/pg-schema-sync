@@ -2,7 +2,7 @@
 from psycopg2 import sql # SQL 식별자 안전 처리용
 import json
 import concurrent.futures
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 import yaml # YAML 라이브러리 임포트
 import psycopg2
 from psycopg2 import sql # SQL 식별자 안전 처리용
@@ -182,21 +182,35 @@ def sort_tables_by_fk_dependency(tables_metadata):
                 graph[ref_table].add(table)
                 in_degree[table] += 1
 
-    queue = deque([t for t in tables_metadata if in_degree[t] == 0])
+    # 모든 테이블을 이름 길이 순으로 정렬
+    all_tables_sorted_by_length = sorted(tables_metadata.keys(), key=lambda x: len(x))
+    
+    # 의존성이 없는 테이블들을 이름 길이 순으로 정렬
+    independent_tables = [t for t in all_tables_sorted_by_length if in_degree[t] == 0]
+    queue = deque(independent_tables)
     sorted_tables = []
 
     while queue:
         current = queue.popleft()
         sorted_tables.append(current)
+        
+        # 의존성이 해결된 테이블들을 이름 길이 순으로 정렬하여 큐에 추가
+        new_dependents = []
         for dependent in graph[current]:
             in_degree[dependent] -= 1
             if in_degree[dependent] == 0:
-                queue.append(dependent)
+                new_dependents.append(dependent)
+        
+        # 새로운 의존성 해결된 테이블들을 이름 길이 순으로 정렬하여 큐에 추가
+        new_dependents.sort(key=lambda x: len(x))
+        queue.extend(new_dependents)
 
     if len(sorted_tables) < len(tables_metadata):
         print("⚠️ Warning: Cyclic dependency detected among tables!")
         remaining = set(tables_metadata) - set(sorted_tables)
-        sorted_tables.extend(remaining)
+        # 남은 테이블들도 이름 길이 순으로 정렬
+        remaining_sorted = sorted(remaining, key=lambda x: len(x))
+        sorted_tables.extend(remaining_sorted)
 
     # ✅ OrderedDict으로 정렬된 결과 반환
     return OrderedDict((table, tables_metadata[table]) for table in sorted_tables)

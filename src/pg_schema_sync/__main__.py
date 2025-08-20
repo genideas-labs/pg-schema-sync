@@ -307,7 +307,7 @@ def generate_create_table_ddl(table_name, columns,
 
         # 사용자 정의 enum 타입 처리
         if isinstance(col_type, str) and col_type.upper() == 'USER-DEFINED':
-            if table_name in ("menu_item_opts_set_schema", "menu_item_opts_schema") and col['name'] == "type":
+            if table_name in ("menu_item_opts_set_schema", "menu_item_opts_schema", "cur_option_set_schema") and col['name'] == "type":
                 col_type = "public.option_type"
                 enum_ddls.append(
                     """DO $$
@@ -337,6 +337,10 @@ BEGIN
   END IF;
 END$$;"""
                 )
+            else:
+                # 알 수 없는 USER-DEFINED 타입의 경우 text로 대체
+                print(f"    ⚠️  Unknown USER-DEFINED type for {table_name}.{col['name']}, using text instead")
+                col_type = "text"
 
         # ✅ inline 컬럼 정의 처리
         is_identity = col.get("identity", False)

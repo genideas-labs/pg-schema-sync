@@ -85,21 +85,56 @@ def fetch_tables_metadata(conn):
     """)
     table_names = [row[0] for row in cur.fetchall()]
 
-    # 2. 제약조건 정보: FK / UNIQUE / PRIMARY
+    # 2. 제약조건 정보: FK는 별도 쿼리로, UNIQUE / PRIMARY는 기존 방식
+    # FK 정보를 pg_constraint에서 직접 가져와서 중복 방지 및 CASCADE 옵션 포함
+    cur.execute("""
+    SELECT
+        con.conname AS constraint_name,
+        tbl.relname AS table_name,
+        ARRAY_AGG(att.attname ORDER BY u.pos) AS columns,
+        ref_tbl.relname AS ref_table_name,
+        ARRAY_AGG(ref_att.attname ORDER BY u.pos) AS ref_columns,
+        con.confdeltype AS on_delete,
+        con.confupdtype AS on_update
+    FROM pg_constraint con
+    JOIN pg_class tbl ON con.conrelid = tbl.oid
+    JOIN pg_namespace ns ON tbl.relnamespace = ns.oid
+    JOIN pg_class ref_tbl ON con.confrelid = ref_tbl.oid
+    JOIN LATERAL UNNEST(con.conkey) WITH ORDINALITY AS u(attnum, pos) ON TRUE
+    JOIN pg_attribute att ON att.attrelid = tbl.oid AND att.attnum = u.attnum
+    JOIN LATERAL UNNEST(con.confkey) WITH ORDINALITY AS u2(ref_attnum, pos2) ON u.pos = u2.pos2
+    JOIN pg_attribute ref_att ON ref_att.attrelid = ref_tbl.oid AND ref_att.attnum = u2.ref_attnum
+    WHERE con.contype = 'f'
+      AND ns.nspname = 'public'
+    GROUP BY con.conname, tbl.relname, ref_tbl.relname, con.confdeltype, con.confupdtype
+    ORDER BY tbl.relname, con.conname;
+    """)
+    
+    composite_fks_temp = defaultdict(list)
+    for constraint_name, table, columns, ref_table, ref_columns, on_delete, on_update in cur.fetchall():
+        composite_fks_temp[table].append({
+            'constraint_name': constraint_name,
+            'columns': columns,
+            'ref_table': ref_table,
+            'ref_columns': ref_columns,
+            'on_delete': on_delete,
+            'on_update': on_update
+        })
+    
+    # UNIQUE와 PRIMARY KEY는 기존 방식으로 조회
     cur.execute("""
     SELECT
       tc.constraint_name,
       tc.constraint_type,
       tc.table_name,
       kcu.column_name,
-      ccu.table_name AS foreign_table,
-      ccu.column_name AS foreign_column
+      kcu.ordinal_position
     FROM information_schema.table_constraints AS tc
     LEFT JOIN information_schema.key_column_usage AS kcu
       ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-    LEFT JOIN information_schema.constraint_column_usage AS ccu
-      ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
-    WHERE tc.table_schema = 'public';
+    WHERE tc.table_schema = 'public'
+      AND tc.constraint_type IN ('UNIQUE', 'PRIMARY KEY')
+    ORDER BY tc.constraint_name, kcu.ordinal_position;
     """)
 
     fk_lookup = {}
@@ -108,15 +143,43 @@ def fetch_tables_metadata(conn):
     composite_uniques_temp = defaultdict(list)
     composite_primaries_temp = defaultdict(list)
 
-    for constraint_name, constraint_type, table, column, ref_table, ref_col in cur.fetchall():
-        if constraint_type == 'FOREIGN KEY' and ref_table and ref_col:
-            fk_lookup[(table, column)] = {'table': ref_table, 'column': ref_col}
-        elif constraint_type == 'UNIQUE':
+    for constraint_name, constraint_type, table, column, ordinal_pos in cur.fetchall():
+        if constraint_type == 'UNIQUE':
             if column:
                 composite_uniques_temp[(table, constraint_name)].append(column)
         elif constraint_type == 'PRIMARY KEY':
             if column:
                 composite_primaries_temp[(table, constraint_name)].append(column)
+
+    # 모든 FK를 composite_fks_final에 저장 (단일 컬럼과 복합 FK 모두)
+    composite_fks_final = defaultdict(list)
+    for table, fk_list in composite_fks_temp.items():
+        for fk_info in fk_list:
+            cols = fk_info['columns']
+            ref_table = fk_info['ref_table']
+            ref_cols = fk_info['ref_columns']
+            constraint_name = fk_info['constraint_name']
+            on_delete = fk_info['on_delete']
+            on_update = fk_info['on_update']
+            
+            # 단일 및 복합 FK 모두 composite_fks_final에 저장
+            composite_fks_final[table].append({
+                'constraint_name': constraint_name,
+                'columns': cols,
+                'ref_table': ref_table,
+                'ref_columns': ref_cols,
+                'on_delete': on_delete,
+                'on_update': on_update
+            })
+            
+            # 단일 컬럼 FK는 컬럼 메타데이터에도 기록 (하위 호환성)
+            if len(cols) == 1:
+                fk_lookup[(table, cols[0])] = {
+                    'table': ref_table, 
+                    'column': ref_cols[0],
+                    'on_delete': on_delete,
+                    'on_update': on_update
+                }
 
     for (table, constraint), cols in composite_uniques_temp.items():
         if len(cols) == 1:
@@ -196,7 +259,7 @@ def fetch_tables_metadata(conn):
         tables_metadata[table_name] = columns
 
     cur.close()
-    return tables_metadata, final_composite_uniques, final_composite_primaries
+    return tables_metadata, final_composite_uniques, final_composite_primaries, composite_fks_final
 
 # def fetch_tables_metadata(conn):
 #     """테이블별 컬럼 메타데이터(이름, 타입, Null여부, 기본값, identity, FK, UNIQUE)를 조회합니다."""
@@ -490,7 +553,7 @@ def fetch_sequences(conn):
     cur = conn.cursor()
     
     # IDENTITY 컬럼의 시퀀스는 자동으로 생성되므로 제외
-    # 테이블의 IDENTITY 컬럼과 연결된 시퀀스 목록 조회
+    # pg_depend를 사용하여 IDENTITY 시퀀스 확인
     cur.execute("""
     SELECT 
         c.relname as sequence_name
@@ -498,15 +561,14 @@ def fetch_sequences(conn):
     JOIN pg_namespace n ON c.relnamespace = n.oid 
     WHERE n.nspname = 'public' 
       AND c.relkind = 'S'
-      AND c.relname NOT IN (
-        -- IDENTITY 컬럼의 시퀀스 제외
-        SELECT 
-            pg_get_serial_sequence(t.table_name, c.column_name)::regclass::text
-        FROM information_schema.tables t
-        JOIN information_schema.columns c ON t.table_name = c.table_name
-        WHERE t.table_schema = 'public' 
-          AND c.table_schema = 'public'
-          AND c.is_identity = 'YES'
+      AND NOT EXISTS (
+        -- IDENTITY 컬럼의 시퀀스 제외 (pg_depend를 통해 IDENTITY 관계 확인)
+        SELECT 1
+        FROM pg_depend d
+        JOIN pg_attribute a ON d.refobjid = a.attrelid AND d.refobjsubid = a.attnum
+        WHERE d.objid = c.oid
+          AND d.deptype = 'i'  -- internal dependency (IDENTITY)
+          AND a.attidentity IN ('a', 'd')  -- ALWAYS or BY DEFAULT
       )
     ORDER BY c.relname;
     """)
@@ -1286,24 +1348,69 @@ def print_verification_report(src_objs, tgt_objs, obj_type):
     print(f"  Status: {status}")
     return is_synced
 
-def extract_foreign_keys(metadata):
+def extract_foreign_keys(metadata, composite_fks):
     """
     { "table.col->ref_table.ref_col": DDL } 형태로 반환
+    복합 FK와 단일 FK를 모두 지원, CASCADE 옵션 포함
+    모든 FK는 composite_fks에서 가져옴 (pg_constraint 기반)
     """
+    
+    def get_fk_action(action_code):
+        """PostgreSQL FK action code를 SQL로 변환"""
+        action_map = {
+            'a': 'NO ACTION',
+            'r': 'RESTRICT',
+            'c': 'CASCADE',
+            'n': 'SET NULL',
+            'd': 'SET DEFAULT'
+        }
+        return action_map.get(action_code, 'NO ACTION')
+    
     fk_map = {}
-    for table_name, columns in metadata.items():
-        for col in columns:
-            fk = col.get("foreign_key")
-            if fk:
-                constraint_key = f"{table_name}.{col['name']}->{fk['table']}.{fk['column']}"
-                constraint_name = f"{table_name}_{col['name']}_fkey"
-                ddl = (
-                    f'ALTER TABLE public."{table_name}" '
-                    f'ADD CONSTRAINT "{constraint_name}" '
-                    f'FOREIGN KEY ("{col["name"]}") '
-                    f'REFERENCES public."{fk["table"]}" ("{fk["column"]}");'
-                )
-                fk_map[constraint_key] = ddl
+    
+    # 모든 FK를 composite_fks에서 처리 (단일 및 복합 FK 모두 포함)
+    for table_name, fk_list in composite_fks.items():
+        for fk_info in fk_list:
+            constraint_name = fk_info['constraint_name']
+            columns = fk_info['columns']
+            ref_table = fk_info['ref_table']
+            ref_columns = fk_info['ref_columns']
+            on_delete = fk_info.get('on_delete', 'a')
+            on_update = fk_info.get('on_update', 'a')
+            
+            # 키 생성
+            if len(columns) == 1:
+                # 단일 컬럼 FK: table.col->ref_table.ref_col
+                constraint_key = f"{table_name}.{columns[0]}->{ref_table}.{ref_columns[0]}"
+            else:
+                # 복합 FK: table.(col1,col2)->ref_table.(ref_col1,ref_col2)
+                cols_str = ','.join(columns)
+                ref_cols_str = ','.join(ref_columns)
+                constraint_key = f"{table_name}.({cols_str})->{ref_table}.({ref_cols_str})"
+            
+            # DDL 생성
+            quoted_cols = ', '.join(f'"{col}"' for col in columns)
+            quoted_ref_cols = ', '.join(f'"{col}"' for col in ref_columns)
+            
+            ddl_parts = [
+                f'ALTER TABLE public."{table_name}"',
+                f'ADD CONSTRAINT "{constraint_name}"',
+                f'FOREIGN KEY ({quoted_cols})',
+                f'REFERENCES public."{ref_table}" ({quoted_ref_cols})'
+            ]
+            
+            # CASCADE 옵션 추가 (NO ACTION이 아닌 경우만)
+            on_delete_action = get_fk_action(on_delete)
+            on_update_action = get_fk_action(on_update)
+            
+            if on_delete_action != 'NO ACTION':
+                ddl_parts.append(f'ON DELETE {on_delete_action}')
+            if on_update_action != 'NO ACTION':
+                ddl_parts.append(f'ON UPDATE {on_update_action}')
+            
+            ddl = ' '.join(ddl_parts) + ';'
+            fk_map[constraint_key] = ddl
+    
     return fk_map
 
 def main():
@@ -1396,8 +1503,8 @@ def main():
     tgt_enum_values = fetch_enums_values(tgt_conn) # 비교용
 
     print("Fetching Table Metadata...")
-    src_tables_meta, src_composite_uniques, src_composite_primaries = fetch_tables_metadata(src_conn)
-    tgt_tables_meta, tgt_composite_uniques, tgt_composite_primaries = fetch_tables_metadata(tgt_conn)
+    src_tables_meta, src_composite_uniques, src_composite_primaries, src_composite_fks = fetch_tables_metadata(src_conn)
+    tgt_tables_meta, tgt_composite_uniques, tgt_composite_primaries, tgt_composite_fks = fetch_tables_metadata(tgt_conn)
 
 
     print("Fetching View DDLs...")
@@ -1534,8 +1641,8 @@ def main():
 
     print("Comparing Foreign Keys...")  # 👈 이 부분 추가
 
-    src_fk_map = extract_foreign_keys(src_tables_meta)
-    tgt_fk_map = extract_foreign_keys(tgt_tables_meta)
+    src_fk_map = extract_foreign_keys(src_tables_meta, src_composite_fks)
+    tgt_fk_map = extract_foreign_keys(tgt_tables_meta, tgt_composite_fks)
 
     mig_sql, skip_sql = compare_and_generate_migration(src_fk_map, tgt_fk_map, "FOREIGN_KEY")
     all_migration_sql.extend(mig_sql)
@@ -1587,7 +1694,7 @@ def main():
     if args.with_data:
         print("\n-- Running Data Migration --")
         try:
-            run_data_migration_parallel(src_conn, src_tables_meta)
+            run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks)
             print("\nData migration completed and committed.")
 
             # 데이터 마이그레이션 이후 시퀀스 검증 및 수정 실행

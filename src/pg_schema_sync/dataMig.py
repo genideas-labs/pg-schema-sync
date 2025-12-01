@@ -20,6 +20,7 @@ def migrate_single_table(source_config, target_config, table_name, table_meta):
         src_conn = get_connection(source_config)
         with src_conn.cursor() as src_cur, tgt_conn.cursor() as tgt_cur:
             print(f"  Migrating data for table: {table_name}")
+            
             src_cur.execute(f'SELECT * FROM public."{table_name}"')
             rows = src_cur.fetchall()
 
@@ -48,18 +49,17 @@ def migrate_single_table(source_config, target_config, table_name, table_meta):
                 )
                 for row in rows
             ]
-            # 기존
+            
             tgt_cur.executemany(insert_sql, serialized_rows)
-            tgt_conn.commit()
             print(f"    Inserted {len(rows)} rows into {table_name}")
-
-            # 변경
-            # batch_insert(tgt_conn, tgt_cur, insert_sql, serialized_rows, table_name, batch_size=1000)
+            
+            tgt_conn.commit()
         return True, None
 
     except Exception as e:
         # 롤백하고 에러 리포트
         print(f"  ❌ {table_name}: fail migrate")
+        print(f"     Error: {type(e).__name__}: {str(e)}")  # 에러 타입과 메시지 출력
         if tgt_conn and not tgt_conn.closed:
             tgt_conn.rollback()
             src_conn.rollback()
@@ -97,17 +97,174 @@ def serialize_value(val, pg_type=None):
         return json.dumps(val)
     return val
 
+def get_all_foreign_keys(conn):
+    """타겟 DB의 모든 FK 제약조건 정보를 가져옵니다."""
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT 
+            conrelid::regclass AS table_name,
+            conname AS constraint_name,
+            pg_get_constraintdef(pc.oid) AS constraint_def
+        FROM pg_constraint pc
+        JOIN pg_namespace n ON n.oid = pc.connamespace
+        WHERE pc.contype = 'f' AND n.nspname = 'public'
+        ORDER BY table_name, conname;
+        """)
+        return cur.fetchall()
 
-def run_data_migration_parallel(src_conn ,src_tables_meta, max_total_attempts=10):
-    sorted_table_meta = sort_tables_by_fk_dependency(src_tables_meta)
+def drop_all_foreign_keys(conn):
+    """모든 FK 제약조건을 소규모 batch로 DROP합니다 (lock 방지)."""
+    print("\n🔓 Dropping all FK constraints (small batch mode)...", flush=True)
+    fks = get_all_foreign_keys(conn)
+    
+    if not fks:
+        print("  No FK constraints found.")
+        return []
+    
+    print(f"  Found {len(fks)} FK constraints to drop.", flush=True)
+    
+    # 작은 배치로 나눠서 처리 (lock 방지)
+    BATCH_SIZE = 10
+    dropped_count = 0
+    failed_count = 0
+    
+    with conn.cursor() as cur:
+        # lock timeout 설정 - 긴 대기 시간으로 설정
+        cur.execute("SET lock_timeout = '10min';")
+        # statement timeout도 설정 (전체 문장이 너무 오래 걸리면 중단)
+        cur.execute("SET statement_timeout = '15min';")
+        print("  ⏱️  Lock timeout set to 10 minutes (will wait for locks)", flush=True)
+        for i in range(0, len(fks), BATCH_SIZE):
+            batch = fks[i:i+BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (len(fks) + BATCH_SIZE - 1) // BATCH_SIZE
+            
+            print(f"  Processing batch {batch_num}/{total_batches} ({len(batch)} FKs)...", flush=True)
+            
+            try:
+                for table_name, constraint_name, _ in batch:
+                    drop_sql = f'ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS "{constraint_name}";'
+                    cur.execute(drop_sql)
+                    dropped_count += 1
+                    print(f"    ✓ Dropped: {table_name}.{constraint_name}", flush=True)
+                
+                # 배치마다 커밋
+                conn.commit()
+                print(f"  ✅ Batch {batch_num} committed ({dropped_count}/{len(fks)} total)", flush=True)
+                
+            except Exception as e:
+                conn.rollback()
+                print(f"  ❌ Batch {batch_num} failed: {e}", flush=True)
+                print(f"  Retrying batch one by one...", flush=True)
+                
+                # 실패한 배치는 하나씩 재시도
+                for table_name, constraint_name, _ in batch:
+                    try:
+                        drop_sql = f'ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS "{constraint_name}";'
+                        cur.execute(drop_sql)
+                        conn.commit()
+                        dropped_count += 1
+                        print(f"    ✓ Dropped: {table_name}.{constraint_name}", flush=True)
+                    except Exception as e2:
+                        conn.rollback()
+                        failed_count += 1
+                        print(f"    ✗ Failed: {table_name}.{constraint_name}: {e2}", flush=True)
+    
+    print(f"\n✅ Dropped {dropped_count}/{len(fks)} FK constraints (Failed: {failed_count}).\n", flush=True)
+    return fks
+
+def recreate_foreign_keys_not_valid(conn, fks):
+    """FK 제약조건을 NOT VALID로 소규모 batch 재생성합니다."""
+    print("\n🔗 Recreating FK constraints (NOT VALID, small batch mode)...", flush=True)
+    
+    if not fks:
+        print("  No FK constraints to recreate.")
+        return
+    
+    # 작은 배치로 나눠서 처리 (lock 방지)
+    BATCH_SIZE = 10
+    added_count = 0
+    failed_count = 0
+    
+    with conn.cursor() as cur:
+        # lock timeout 설정 - 긴 대기 시간으로 설정
+        cur.execute("SET lock_timeout = '10min';")
+        print("  ⏱️  Lock timeout set to 10 minutes (will wait for locks)", flush=True)
+        for i in range(0, len(fks), BATCH_SIZE):
+            batch = fks[i:i+BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (len(fks) + BATCH_SIZE - 1) // BATCH_SIZE
+            
+            print(f"  Processing batch {batch_num}/{total_batches} ({len(batch)} FKs)...", flush=True)
+            
+            try:
+                for table_name, constraint_name, constraint_def in batch:
+                    add_sql = f'ALTER TABLE {table_name} ADD CONSTRAINT "{constraint_name}" {constraint_def} NOT VALID;'
+                    cur.execute(add_sql)
+                    added_count += 1
+                    print(f"    ✓ Added: {table_name}.{constraint_name}", flush=True)
+                
+                # 배치마다 커밋
+                conn.commit()
+                print(f"  ✅ Batch {batch_num} committed ({added_count}/{len(fks)} total)", flush=True)
+                
+            except Exception as e:
+                conn.rollback()
+                print(f"  ❌ Batch {batch_num} failed: {e}", flush=True)
+                print(f"  Retrying batch one by one...", flush=True)
+                
+                # 실패한 배치는 하나씩 재시도
+                for table_name, constraint_name, constraint_def in batch:
+                    try:
+                        add_sql = f'ALTER TABLE {table_name} ADD CONSTRAINT "{constraint_name}" {constraint_def} NOT VALID;'
+                        cur.execute(add_sql)
+                        conn.commit()
+                        added_count += 1
+                        print(f"    ✓ Added: {table_name}.{constraint_name}", flush=True)
+                    except Exception as e2:
+                        conn.rollback()
+                        failed_count += 1
+                        print(f"    ✗ Failed: {table_name}.{constraint_name}: {e2}", flush=True)
+    
+    print(f"\n✅ Recreated {added_count}/{len(fks)} FK constraints (Failed: {failed_count}).\n", flush=True)
+
+def generate_validate_script(fks, output_file='validate_fks.sql'):
+    """FK VALIDATE 스크립트를 파일로 생성합니다 (나중에 트래픽 없는 시간대에 실행)."""
+    print(f"\n📝 Generating VALIDATE script: {output_file}", flush=True)
+    
+    if not fks:
+        print("  No FK constraints to validate.")
+        return
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("-- FK VALIDATE Script\n")
+        f.write("-- 이 스크립트는 트래픽이 적은 시간대에 실행하세요.\n")
+        f.write("-- VALIDATE는 전체 테이블을 스캔하므로 시간이 오래 걸릴 수 있습니다.\n")
+        f.write(f"-- Total: {len(fks)} FK constraints\n\n")
+        f.write("-- Progress tracking:\n")
+        f.write("-- \\timing on\n\n")
+        
+        for idx, (table_name, constraint_name, _) in enumerate(fks, 1):
+            f.write(f"-- [{idx}/{len(fks)}] Validating {table_name}.{constraint_name}\n")
+            f.write(f"ALTER TABLE {table_name} VALIDATE CONSTRAINT \"{constraint_name}\";\n")
+            if idx % 10 == 0:
+                f.write(f"-- Progress: {idx}/{len(fks)} completed\n")
+            f.write("\n")
+        
+        f.write("-- All FK constraints validated!\n")
+    
+    print(f"✅ VALIDATE script generated: {output_file}", flush=True)
+    print(f"   Run this script later with: psql -f {output_file}\n", flush=True)
+
+def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=None, max_total_attempts=10):
+    # FK 의존성 정렬이 필요 없음 - FK를 미리 DROP하므로
     print("\n--- Starting Parallel Data Migration ---")
-    print(f"sorted table list: {list(sorted_table_meta.keys())}")
-    # remaining_tables = list(sorted_table_meta.items())  # ✅ 리스트로 만들어야 여러 번 순회 가능
+    print(f"Total tables to migrate: {len(src_tables_meta)}")
+    
     remaining_tables = [
-    (tbl, meta)
-    for tbl, meta in sorted_table_meta.items()
-    # 우선 slow_request_logs, member_action_log 로그가 너무 많아 제외하고 테스트
-    if tbl not in SKIP_TABLES
+        (tbl, meta)
+        for tbl, meta in src_tables_meta.items()
+        if tbl not in SKIP_TABLES
     ]
 
     table_errors = defaultdict(str)
@@ -128,8 +285,14 @@ def run_data_migration_parallel(src_conn ,src_tables_meta, max_total_attempts=10
         return
     target_config = config['targets']['gcp_test']
     source_config = config['source']
+    
+    # 1. 타겟 DB에서 모든 FK 저장 후 DROP
+    tgt_conn = get_connection(target_config)
+    dropped_fks = drop_all_foreign_keys(tgt_conn)
+    tgt_conn.close()
 
     
+    # 2. 데이터 마이그레이션 (FK 없이 빠르게)
     for attempt in range(1, max_total_attempts + 1):
         print(f"\n=== Migration Attempt {attempt} ===")
         if not remaining_tables:
@@ -147,32 +310,42 @@ def run_data_migration_parallel(src_conn ,src_tables_meta, max_total_attempts=10
                 try:
                     success, error_msg = future.result()
                     if not success:
-                        table_meta = sorted_table_meta[table_name]
+                        table_meta = src_tables_meta[table_name]
                         next_round.append((table_name, table_meta))
                         table_errors[table_name] = error_msg or f"Failed on attempt {attempt}"
                 except Exception as exc:
-                    table_meta = sorted_table_meta[table_name]
+                    table_meta = src_tables_meta[table_name]
                     next_round.append((table_name, table_meta))
                     table_errors[table_name] = str(exc)
 
-            remaining_tables = next_round  # ✅ 튜플의 리스트 형태 유지
-
+            remaining_tables = next_round
+    
+    # 3. FK 재생성 (NOT VALID)
+    tgt_conn = get_connection(target_config)
+    recreate_foreign_keys_not_valid(tgt_conn, dropped_fks)
+    tgt_conn.close()
+    
+    # 4. VALIDATE 스크립트 생성 (나중에 수동 실행)
+    generate_validate_script(dropped_fks, output_file='validate_fks.sql')
+    
     if remaining_tables:
         print("\n--- Data Migration Completed with Failures ---")
         for table_name, _ in remaining_tables:
             print(f"  ❌ {table_name}: {table_errors[table_name]}")
     else:
         print("\n✅ All tables migrated successfully.")
-        # ✅ 연결 닫기
+        print("✅ 데이터 마이그레이션 완료")
     
     
 
 from collections import defaultdict, deque, OrderedDict
 
-def sort_tables_by_fk_dependency(tables_metadata):
+def sort_tables_by_fk_dependency(tables_metadata, composite_fks=None):
     graph = defaultdict(set)  # {A: {B}} → A는 B에 종속됨 (즉, B → A)
     in_degree = defaultdict(int)
+    fk_count = 0
 
+    # 1. 단일 컬럼 FK 처리
     for table, columns in tables_metadata.items():
         in_degree.setdefault(table, 0)
         for col in columns:
@@ -181,36 +354,53 @@ def sort_tables_by_fk_dependency(tables_metadata):
                 ref_table = fk["table"]
                 graph[ref_table].add(table)
                 in_degree[table] += 1
-
-    # 모든 테이블을 이름 길이 순으로 정렬
-    all_tables_sorted_by_length = sorted(tables_metadata.keys(), key=lambda x: len(x))
+                fk_count += 1
     
-    # 의존성이 없는 테이블들을 이름 길이 순으로 정렬
-    independent_tables = [t for t in all_tables_sorted_by_length if in_degree[t] == 0]
+    # 2. 복합 FK 처리 (새로 추가)
+    composite_fk_count = 0
+    if composite_fks:
+        for table, fk_list in composite_fks.items():
+            in_degree.setdefault(table, 0)
+            for fk_info in fk_list:
+                ref_table = fk_info['ref_table']
+                # 중복 카운트 방지: 이미 단일 FK로 추가된 경우 제외
+                if table not in graph[ref_table]:
+                    graph[ref_table].add(table)
+                    in_degree[table] += 1
+                    composite_fk_count += 1
+    
+    print(f"\n🔗 FK Dependencies detected:")
+    print(f"  - Single column FKs: {fk_count}")
+    print(f"  - Composite FKs: {composite_fk_count}")
+    print(f"  - Total FK relationships: {fk_count + composite_fk_count}")
+
+    # 위상 정렬 (Topological Sort)
+    # 의존성이 없는 테이블들(부모 테이블)부터 시작
+    independent_tables = sorted([t for t in tables_metadata.keys() if in_degree[t] == 0])
     queue = deque(independent_tables)
     sorted_tables = []
+
+    print(f"  - Independent tables (no FK dependencies): {len(independent_tables)}")
 
     while queue:
         current = queue.popleft()
         sorted_tables.append(current)
         
-        # 의존성이 해결된 테이블들을 이름 길이 순으로 정렬하여 큐에 추가
-        new_dependents = []
-        for dependent in graph[current]:
+        # 현재 테이블에 의존하는 테이블들의 in_degree 감소
+        # 즉, 현재 테이블(부모)을 참조하는 자식 테이블들 확인
+        for dependent in sorted(graph[current]):  # 알파벳 순 정렬로 일관성 유지
             in_degree[dependent] -= 1
             if in_degree[dependent] == 0:
-                new_dependents.append(dependent)
-        
-        # 새로운 의존성 해결된 테이블들을 이름 길이 순으로 정렬하여 큐에 추가
-        new_dependents.sort(key=lambda x: len(x))
-        queue.extend(new_dependents)
+                # 모든 의존성이 해결되면 큐에 추가
+                queue.append(dependent)
 
+    # 순환 참조 감지
     if len(sorted_tables) < len(tables_metadata):
-        print("⚠️ Warning: Cyclic dependency detected among tables!")
+        print("\n⚠️ Warning: Cyclic dependency detected among tables!")
         remaining = set(tables_metadata) - set(sorted_tables)
-        # 남은 테이블들도 이름 길이 순으로 정렬
-        remaining_sorted = sorted(remaining, key=lambda x: len(x))
-        sorted_tables.extend(remaining_sorted)
+        print(f"  - Tables with circular dependencies: {sorted(remaining)}")
+        # 순환 참조가 있는 테이블들은 알파벳 순으로 추가
+        sorted_tables.extend(sorted(remaining))
 
     # ✅ OrderedDict으로 정렬된 결과 반환
     return OrderedDict((table, tables_metadata[table]) for table in sorted_tables)

@@ -130,10 +130,10 @@ def drop_all_foreign_keys(conn):
     
     with conn.cursor() as cur:
         # lock timeout 설정 - 긴 대기 시간으로 설정
-        cur.execute("SET lock_timeout = '10min';")
+        cur.execute("SET lock_timeout = '3s';")
         # statement timeout도 설정 (전체 문장이 너무 오래 걸리면 중단)
-        cur.execute("SET statement_timeout = '15min';")
-        print("  ⏱️  Lock timeout set to 10 minutes (will wait for locks)", flush=True)
+        cur.execute("SET statement_timeout = '10s';")
+        print("  ⏱️  Lock timeout set to 3 seconds (will quickly skip busy tables)", flush=True)
         for i in range(0, len(fks), BATCH_SIZE):
             batch = fks[i:i+BATCH_SIZE]
             batch_num = i // BATCH_SIZE + 1
@@ -188,8 +188,8 @@ def recreate_foreign_keys_not_valid(conn, fks):
     
     with conn.cursor() as cur:
         # lock timeout 설정 - 긴 대기 시간으로 설정
-        cur.execute("SET lock_timeout = '10min';")
-        print("  ⏱️  Lock timeout set to 10 minutes (will wait for locks)", flush=True)
+        cur.execute("SET lock_timeout = '3s';")
+        print("  ⏱️  Lock timeout set to 3 seconds (will quickly skip busy tables)", flush=True)
         for i in range(0, len(fks), BATCH_SIZE):
             batch = fks[i:i+BATCH_SIZE]
             batch_num = i // BATCH_SIZE + 1

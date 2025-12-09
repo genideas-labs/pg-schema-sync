@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
-from psycopg2 import sql # SQL 식별자 안전 처리용
 import json
-import concurrent.futures
 from collections import defaultdict, deque, OrderedDict
-import yaml # YAML 라이브러리 임포트
+import yaml
 import psycopg2
-from psycopg2 import sql # SQL 식별자 안전 처리용
+from psycopg2 import sql
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 def get_connection(config):
     conn = psycopg2.connect(**config)
     return conn
 SKIP_TABLES = {'slow_request_logs', 'member_action_log'}
 
-def migrate_single_table(source_config, target_config, table_name, table_meta):
-    
+def migrate_single_table_with_conn(src_conn, tgt_conn, table_name, table_meta):
+    """연결을 재사용하여 단일 테이블 데이터를 마이그레이션합니다."""
     try:
-        print("Connecting to target database (gcp_test)...")
-        tgt_conn = get_connection(target_config)
-        src_conn = get_connection(source_config)
         with src_conn.cursor() as src_cur, tgt_conn.cursor() as tgt_cur:
-            print(f"  Migrating data for table: {table_name}")
-            
             src_cur.execute(f'SELECT * FROM public."{table_name}"')
             rows = src_cur.fetchall()
 
             if not rows:
-                print(f"    No data found in source {table_name}, skipping.")
+                print(f"  ⏭️  {table_name}: No data, skipped", flush=True)
                 return True, None
 
             column_names = [desc[0] for desc in src_cur.description]
@@ -51,28 +46,15 @@ def migrate_single_table(source_config, target_config, table_name, table_meta):
             ]
             
             tgt_cur.executemany(insert_sql, serialized_rows)
-            print(f"    Inserted {len(rows)} rows into {table_name}")
-            
             tgt_conn.commit()
+            print(f"  ✅ {table_name}: Inserted {len(rows)} rows", flush=True)
         return True, None
 
     except Exception as e:
         # 롤백하고 에러 리포트
-        print(f"  ❌ {table_name}: fail migrate")
-        print(f"     Error: {type(e).__name__}: {str(e)}")  # 에러 타입과 메시지 출력
-        if tgt_conn and not tgt_conn.closed:
-            tgt_conn.rollback()
-            src_conn.rollback()
+        tgt_conn.rollback()
+        print(f"  ❌ {table_name}: {type(e).__name__}: {str(e)}", flush=True)
         return False, str(e)
-
-    finally:
-        # 2) 항상 닫아 준다
-        try:
-            if tgt_conn and not tgt_conn.closed:
-                tgt_conn.close()
-                src_conn.close()
-        except:
-            pass
 
 def serialize_value(val, pg_type=None):
     if isinstance(val, list):
@@ -113,8 +95,8 @@ def get_all_foreign_keys(conn):
         return cur.fetchall()
 
 def drop_all_foreign_keys(conn):
-    """모든 FK 제약조건을 소규모 batch로 DROP합니다 (lock 방지)."""
-    print("\n🔓 Dropping all FK constraints (small batch mode)...", flush=True)
+    """모든 FK 제약조건을 배치로 DROP합니다 (빠른 처리)."""
+    print("\n🔓 Dropping all FK constraints (batch mode)...", flush=True)
     fks = get_all_foreign_keys(conn)
     
     if not fks:
@@ -123,39 +105,35 @@ def drop_all_foreign_keys(conn):
     
     print(f"  Found {len(fks)} FK constraints to drop.", flush=True)
     
-    # 작은 배치로 나눠서 처리 (lock 방지)
-    BATCH_SIZE = 10
+    # 배치 크기 (적절한 크기로 빠르게 처리하면서도 실패 시 재시도 가능)
+    BATCH_SIZE = 20
     dropped_count = 0
     failed_count = 0
     
     with conn.cursor() as cur:
-        # lock timeout 설정 - 긴 대기 시간으로 설정
-        cur.execute("SET lock_timeout = '3s';")
-        # statement timeout도 설정 (전체 문장이 너무 오래 걸리면 중단)
-        cur.execute("SET statement_timeout = '10s';")
-        print("  ⏱️  Lock timeout set to 3 seconds (will quickly skip busy tables)", flush=True)
+        # lock timeout 설정 - 외부 충돌은 이미 해결되었으므로 적당히 설정
+        cur.execute("SET lock_timeout = '10s';")
+        print(f"  ⏱️  Lock timeout set to 10 seconds", flush=True)
+        
         for i in range(0, len(fks), BATCH_SIZE):
             batch = fks[i:i+BATCH_SIZE]
             batch_num = i // BATCH_SIZE + 1
             total_batches = (len(fks) + BATCH_SIZE - 1) // BATCH_SIZE
             
-            print(f"  Processing batch {batch_num}/{total_batches} ({len(batch)} FKs)...", flush=True)
-            
             try:
+                # 배치 전체 실행
                 for table_name, constraint_name, _ in batch:
                     drop_sql = f'ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS "{constraint_name}";'
                     cur.execute(drop_sql)
                     dropped_count += 1
-                    print(f"    ✓ Dropped: {table_name}.{constraint_name}", flush=True)
                 
                 # 배치마다 커밋
                 conn.commit()
-                print(f"  ✅ Batch {batch_num} committed ({dropped_count}/{len(fks)} total)", flush=True)
+                print(f"  ✅ Batch {batch_num}/{total_batches}: Dropped {len(batch)} FKs ({dropped_count}/{len(fks)} total)", flush=True)
                 
             except Exception as e:
                 conn.rollback()
-                print(f"  ❌ Batch {batch_num} failed: {e}", flush=True)
-                print(f"  Retrying batch one by one...", flush=True)
+                print(f"  ⚠️  Batch {batch_num} failed, retrying one by one...", flush=True)
                 
                 # 실패한 배치는 하나씩 재시도
                 for table_name, constraint_name, _ in batch:
@@ -164,54 +142,54 @@ def drop_all_foreign_keys(conn):
                         cur.execute(drop_sql)
                         conn.commit()
                         dropped_count += 1
-                        print(f"    ✓ Dropped: {table_name}.{constraint_name}", flush=True)
                     except Exception as e2:
                         conn.rollback()
                         failed_count += 1
-                        print(f"    ✗ Failed: {table_name}.{constraint_name}: {e2}", flush=True)
+                        if 'lock timeout' in str(e2).lower():
+                            print(f"    ⏭️  Skipped (busy): {table_name}.{constraint_name}", flush=True)
+                        else:
+                            print(f"    ✗ Failed: {table_name}.{constraint_name}: {e2}", flush=True)
     
     print(f"\n✅ Dropped {dropped_count}/{len(fks)} FK constraints (Failed: {failed_count}).\n", flush=True)
     return fks
 
 def recreate_foreign_keys_not_valid(conn, fks):
-    """FK 제약조건을 NOT VALID로 소규모 batch 재생성합니다."""
-    print("\n🔗 Recreating FK constraints (NOT VALID, small batch mode)...", flush=True)
+    """FK 제약조건을 배치로 NOT VALID로 재생성합니다 (빠른 처리)."""
+    print("\n🔗 Recreating FK constraints (NOT VALID, batch mode)...", flush=True)
     
     if not fks:
         print("  No FK constraints to recreate.")
         return
     
-    # 작은 배치로 나눠서 처리 (lock 방지)
-    BATCH_SIZE = 10
+    # 배치 크기 (적절한 크기로 빠르게 처리하면서도 실패 시 재시도 가능)
+    BATCH_SIZE = 20
     added_count = 0
     failed_count = 0
     
     with conn.cursor() as cur:
-        # lock timeout 설정 - 긴 대기 시간으로 설정
-        cur.execute("SET lock_timeout = '3s';")
-        print("  ⏱️  Lock timeout set to 3 seconds (will quickly skip busy tables)", flush=True)
+        # lock timeout 설정 - 외부 충돌은 이미 해결되었으므로 적당히 설정
+        cur.execute("SET lock_timeout = '10s';")
+        print(f"  ⏱️  Lock timeout set to 10 seconds", flush=True)
+        
         for i in range(0, len(fks), BATCH_SIZE):
             batch = fks[i:i+BATCH_SIZE]
             batch_num = i // BATCH_SIZE + 1
             total_batches = (len(fks) + BATCH_SIZE - 1) // BATCH_SIZE
             
-            print(f"  Processing batch {batch_num}/{total_batches} ({len(batch)} FKs)...", flush=True)
-            
             try:
+                # 배치 전체 실행
                 for table_name, constraint_name, constraint_def in batch:
                     add_sql = f'ALTER TABLE {table_name} ADD CONSTRAINT "{constraint_name}" {constraint_def} NOT VALID;'
                     cur.execute(add_sql)
                     added_count += 1
-                    print(f"    ✓ Added: {table_name}.{constraint_name}", flush=True)
                 
                 # 배치마다 커밋
                 conn.commit()
-                print(f"  ✅ Batch {batch_num} committed ({added_count}/{len(fks)} total)", flush=True)
+                print(f"  ✅ Batch {batch_num}/{total_batches}: Added {len(batch)} FKs ({added_count}/{len(fks)} total)", flush=True)
                 
             except Exception as e:
                 conn.rollback()
-                print(f"  ❌ Batch {batch_num} failed: {e}", flush=True)
-                print(f"  Retrying batch one by one...", flush=True)
+                print(f"  ⚠️  Batch {batch_num} failed, retrying one by one...", flush=True)
                 
                 # 실패한 배치는 하나씩 재시도
                 for table_name, constraint_name, constraint_def in batch:
@@ -220,11 +198,13 @@ def recreate_foreign_keys_not_valid(conn, fks):
                         cur.execute(add_sql)
                         conn.commit()
                         added_count += 1
-                        print(f"    ✓ Added: {table_name}.{constraint_name}", flush=True)
                     except Exception as e2:
                         conn.rollback()
                         failed_count += 1
-                        print(f"    ✗ Failed: {table_name}.{constraint_name}: {e2}", flush=True)
+                        if 'lock timeout' in str(e2).lower():
+                            print(f"    ⏭️  Skipped (busy): {table_name}.{constraint_name}", flush=True)
+                        else:
+                            print(f"    ✗ Failed: {table_name}.{constraint_name}: {e2}", flush=True)
     
     print(f"\n✅ Recreated {added_count}/{len(fks)} FK constraints (Failed: {failed_count}).\n", flush=True)
 
@@ -286,44 +266,100 @@ def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=Non
     target_config = config['targets']['gcp_test']
     source_config = config['source']
     
-    # 1. 타겟 DB에서 모든 FK 저장 후 DROP
-    tgt_conn = get_connection(target_config)
-    dropped_fks = drop_all_foreign_keys(tgt_conn)
-    tgt_conn.close()
-
+    # 연결 풀 생성 (병렬 처리용)
+    MAX_WORKERS = 5
+    connection_pool = []
     
-    # 2. 데이터 마이그레이션 (FK 없이 빠르게)
-    for attempt in range(1, max_total_attempts + 1):
-        print(f"\n=== Migration Attempt {attempt} ===")
-        if not remaining_tables:
-            break
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_table = {
-                executor.submit(migrate_single_table, source_config, target_config, table_name, table_meta): table_name
-                for table_name, table_meta in remaining_tables
-            }
-
+    print(f"\n🔌 Creating connection pool ({MAX_WORKERS} workers)...", flush=True)
+    for i in range(MAX_WORKERS):
+        src_conn = get_connection(source_config)
+        tgt_conn = get_connection(target_config)
+        connection_pool.append((src_conn, tgt_conn))
+    print(f"  Connection pool ready: {len(connection_pool)} worker connections", flush=True)
+    
+    # 연결 할당을 위한 lock
+    pool_lock = threading.Lock()
+    available_connections = list(range(MAX_WORKERS))
+    
+    def get_conn_from_pool():
+        """연결 풀에서 연결 쌍 가져오기"""
+        with pool_lock:
+            if available_connections:
+                idx = available_connections.pop(0)
+                return idx, connection_pool[idx]
+            return None, (None, None)
+    
+    def return_conn_to_pool(idx):
+        """연결 풀에 반환"""
+        with pool_lock:
+            available_connections.append(idx)
+    
+    def migrate_table_worker(table_name, table_meta):
+        """Worker 함수: 연결 풀에서 연결 가져와서 테이블 마이그레이션"""
+        conn_idx, (src_conn, tgt_conn) = get_conn_from_pool()
+        try:
+            return migrate_single_table_with_conn(src_conn, tgt_conn, table_name, table_meta)
+        finally:
+            return_conn_to_pool(conn_idx)
+    
+    try:
+        # 1. 타겟 DB에서 모든 FK 저장 후 DROP (첫 번째 연결 사용)
+        dropped_fks = drop_all_foreign_keys(connection_pool[0][1])
+        
+        # 2. 데이터 마이그레이션 (병렬 처리, 연결 풀 재사용)
+        print(f"\n📊 Migrating {len(remaining_tables)} tables in parallel ({MAX_WORKERS} workers)...", flush=True)
+        
+        for attempt in range(1, max_total_attempts + 1):
+            if not remaining_tables:
+                break
+            
+            print(f"\n=== Migration Attempt {attempt}/{max_total_attempts} ===", flush=True)
             next_round = []
-            for future in concurrent.futures.as_completed(future_to_table):
-                table_name = future_to_table[future]
-                try:
-                    success, error_msg = future.result()
-                    if not success:
+            completed = 0
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_table = {
+                    executor.submit(migrate_table_worker, table_name, table_meta): table_name
+                    for table_name, table_meta in remaining_tables
+                }
+                
+                # as_completed로 완료되는 대로 처리 (순서 무관)
+                for future in as_completed(future_to_table):
+                    table_name = future_to_table[future]
+                    try:
+                        success, error_msg = future.result()
+                        completed += 1
+                        
+                        if not success:
+                            table_meta = src_tables_meta[table_name]
+                            next_round.append((table_name, table_meta))
+                            table_errors[table_name] = error_msg or f"Failed on attempt {attempt}"
+                        
+                        # 진행상황 (매 10개마다)
+                        if completed % 10 == 0:
+                            print(f"  Progress: {completed}/{len(remaining_tables)} tables", flush=True)
+                    except Exception as exc:
                         table_meta = src_tables_meta[table_name]
                         next_round.append((table_name, table_meta))
-                        table_errors[table_name] = error_msg or f"Failed on attempt {attempt}"
-                except Exception as exc:
-                    table_meta = src_tables_meta[table_name]
-                    next_round.append((table_name, table_meta))
-                    table_errors[table_name] = str(exc)
-
+                        table_errors[table_name] = str(exc)
+                        completed += 1
+            
+            print(f"  Completed: {completed}/{len(remaining_tables)} tables", flush=True)
             remaining_tables = next_round
-    
-    # 3. FK 재생성 (NOT VALID)
-    tgt_conn = get_connection(target_config)
-    recreate_foreign_keys_not_valid(tgt_conn, dropped_fks)
-    tgt_conn.close()
+        
+        # 3. FK 재생성 (NOT VALID) (첫 번째 연결 사용)
+        recreate_foreign_keys_not_valid(connection_pool[0][1], dropped_fks)
+        
+    finally:
+        # 연결 풀 모두 닫기
+        print("\n🔌 Closing connection pool...", flush=True)
+        for src_conn, tgt_conn in connection_pool:
+            try:
+                src_conn.close()
+                tgt_conn.close()
+            except:
+                pass
+        print("  Connection pool closed.", flush=True)
     
     # 4. VALIDATE 스크립트 생성 (나중에 수동 실행)
     generate_validate_script(dropped_fks, output_file='validate_fks.sql')

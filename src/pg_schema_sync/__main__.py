@@ -1693,6 +1693,23 @@ def main():
 
     if args.with_data:
         print("\n-- Running Data Migration --")
+        
+        # 데이터 마이그레이션 전에 기존 트랜잭션 커밋 및 연결 닫기 (lock 완전 해제)
+        # run_data_migration_parallel이 내부에서 새 연결을 생성함
+        print("  Closing existing connections to release all locks...")
+        try:
+            src_conn.commit()
+            tgt_conn.commit()
+        except:
+            pass
+        src_conn.close()
+        tgt_conn.close()
+        print("  Connections closed, locks released.")
+        
+        # 데이터 마이그레이션 후 시퀀스 검증을 위해 새 연결 생성
+        src_conn = get_connection(source_config)
+        tgt_conn = get_connection(target_config)
+        
         try:
             run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks)
             print("\nData migration completed and committed.")
@@ -1801,9 +1818,11 @@ def main():
 
         except Exception as e:
             print(f"Error during data migration: {e}")
+            tgt_conn.rollback()
             print("Transaction rolled back.")
         finally:
             src_conn.close()
+            tgt_conn.close()
             print("Connections closed.")
         return
     # --- 마이그레이션 SQL 실행 (commit 옵션이 True일 경우) ---
@@ -1813,77 +1832,80 @@ def main():
         else:
             print(f"\nExecuting migration SQL on target database ({target_name})...")
             execution_successful = True
+            executed_count = 0
+            failed_count = 0
+            
             try:
                 with tgt_conn.cursor() as cur:
-                    # 각 SQL 블록 처리
+                    total_blocks = len(all_migration_sql)
+                    
+                    # 각 SQL 블록 처리 (각각 독립적으로 즉시 커밋)
                     for i, sql_block in enumerate(all_migration_sql):
                         # 블록 내 주석 제외 및 실제 실행할 SQL 추출
                         sql_content = "\n".join(line for line in sql_block.strip().splitlines() if not line.strip().startswith('--'))
                         if not sql_content.strip():
                             continue # 실행할 내용 없으면 다음 블록으로
 
-                        # SQL 블록 전체를 단일 문장으로 실행
-                        # (compare_and_generate_migration에서 이미 완전한 DDL 단위로 생성됨)
-                        if not sql_content.strip(): # 추가된 빈 블록 스킵
-                            continue
-
-                        print(f"--- Executing Block {i+1} (1 statement) ---")
+                        print(f"--- Executing Block {i+1}/{total_blocks} ---")
                         try:
                             # sql_content 전체를 실행
-                            print(f"  Executing statement 1: {sql_content[:100]}{'...' if len(sql_content) > 100 else ''}")
+                            print(f"  SQL: {sql_content[:100]}{'...' if len(sql_content) > 100 else ''}")
                             cur.execute(sql_content)
+                            
+                            # ✅ 각 블록마다 즉시 커밋 (lock 빠르게 해제)
+                            tgt_conn.commit()
+                            executed_count += 1
+                            print(f"  ✅ Block {i+1} committed")
+                            
                         except psycopg2.Error as e:
-                            print(f"\nError executing block {i+1}:")
-                            print(f"  Block Content: {sql_content}")
-                            print(f"  Error: {e}")
-                            print("Rolling back transaction...")
+                            failed_count += 1
+                            print(f"  ❌ Block {i+1} failed:")
+                            print(f"     Error: {e}")
+                            print("  Rolling back this block...")
                             tgt_conn.rollback()
-                            print("Transaction rolled back.")
+                            
+                            # DDL 실패는 심각하므로 전체 중단
                             execution_successful = False
-                            break # 오류 발생 시 전체 실행 중단
+                            break
+                            
                         except Exception as e:
-                            print(f"\nAn unexpected error occurred during block {i+1} execution:")
-                            print(f"  Block Content: {sql_content}")
-                            print(f"  Error: {e}")
-                            print("Rolling back transaction...")
+                            failed_count += 1
+                            print(f"  ❌ Block {i+1} unexpected error:")
+                            print(f"     Error: {e}")
+                            print("  Rolling back this block...")
                             tgt_conn.rollback()
-                            print("Transaction rolled back.")
+                            
+                            # 예상치 못한 에러도 전체 중단
                             execution_successful = False
-                            break # 오류 발생 시 전체 실행 중단
+                            break
 
-                # 모든 블록 및 문장이 성공적으로 실행된 경우에만 커밋
+                # 실행 결과 출력 및 후속 작업
                 if execution_successful:
-                    tgt_conn.commit()
-                    print("\nMigration SQL executed successfully and committed.")
+                    print(f"\n✅ Migration SQL executed successfully!")
+                    print(f"   Executed: {executed_count}/{total_blocks} blocks")
                     
-                    # 테이블 마이그레이션 이후 시퀀스 초기화 실행
-                    print("\n--- Initializing Sequences After Table Migration ---")
-                    try:
-                        initialize_sequences_after_migration(src_conn, tgt_conn, src_sequences, src_tables_meta)
-                        tgt_conn.commit()
-                        print("Sequence initialization completed and committed.")
-                    except Exception as e:
-                        print(f"Error during sequence initialization: {e}")
-                        print("Transaction rolled back.")
-                        return
-                    
-                    print("\nSchema migration and sequence initialization completed. Use --with-data to run data migration and sequence verification.")
+                    print("\n✅ Schema migration completed!")
+                    print("💡 Next step: Run with --with-data to migrate data and initialize sequences.")
                     
                     src_conn.close()
                     tgt_conn.close()
                     print("Connections closed.")
                 else:
-                    print("Migration SQL execution failed.")
-            except Exception as e: # 커서 생성 등 외부 try 블록의 예외 처리
-                print(f"\nAn unexpected error occurred during SQL execution setup: {e}")
-                print("Rolling back transaction...")
-                tgt_conn.rollback()
-                print("Transaction rolled back.")
+                    print(f"\n❌ Migration SQL execution failed.")
+                    print(f"   Executed: {executed_count}/{total_blocks} blocks")
+                    print(f"   Failed: {failed_count} blocks")
+                    src_conn.close()
+                    tgt_conn.close()
+                    print("Connections closed.")
+                    
             except Exception as e:
                 print(f"\nAn unexpected error occurred during SQL execution: {e}")
                 print("Rolling back transaction...")
                 tgt_conn.rollback()
                 print("Transaction rolled back.")
+                src_conn.close()
+                tgt_conn.close()
+                print("Connections closed.")
 
     # --- SQL 실행 끝 ---
 

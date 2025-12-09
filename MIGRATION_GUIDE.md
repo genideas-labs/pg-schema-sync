@@ -47,6 +47,14 @@ targets:
 
 ## 🚀 정상 마이그레이션 절차
 
+### 검증 및 연결확인 (변경 없이 차이점 확인)
+
+```bash
+
+python src/pg_schema_sync/__main__.py --verify
+
+```
+
 ### 스키마 마이그레이션
 
 ```bash
@@ -60,14 +68,6 @@ python src/pg_schema_sync/__main__.py --commit
 ```bash
 
 python src/pg_schema_sync/__main__.py --with-data
-
-```
-
-### Option 3: 검증만 (변경 없이 차이점 확인)
-
-```bash
-
-python src/pg_schema_sync/__main__.py --verify
 
 ```
 

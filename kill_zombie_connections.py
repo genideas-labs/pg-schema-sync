@@ -31,7 +31,7 @@ print('-' * 120)
 idle_in_transaction_pids = []
 for row in cur.fetchall():
     pid, usename, state, state_change, duration, query = row
-    print(f'{pid:<8} {usename:<12} {state:<20} {str(duration):<20} {query or "(none)"}')
+    print(f'{pid:<8} {usename:<12} {(state or "None"):<20} {str(duration):<20} {query or "(none)"}')
     if state == 'idle in transaction':
         idle_in_transaction_pids.append(pid)
 

@@ -2,6 +2,8 @@ history
 config.yaml
 SupabaseDB1ToLocal.yaml
 SupabaseDB2ToLocal.yaml
+GCPDB1ToLocal.yaml
+GCPDB2ToLocal.yaml
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

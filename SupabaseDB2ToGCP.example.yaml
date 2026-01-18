@@ -1,0 +1,14 @@
+source:
+  host: SUPABASE_DB2_HOST
+  port: 6543
+  db: postgres
+  username: SUPABASE_DB2_USER
+  password: SUPABASE_DB2_PASSWORD
+
+targets:
+  gcp_test:
+    host: GCP_DB2_HOST
+    port: 5432
+    db: postgres
+    username: GCP_DB2_USER
+    password: GCP_DB2_PASSWORD

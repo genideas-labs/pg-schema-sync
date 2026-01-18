@@ -84,7 +84,7 @@ python -m pg_schema_sync [OPTIONS]
 *   `--use-alter` (실험적): 테이블 컬럼 추가/삭제 시 `DROP/CREATE` 대신 `ALTER TABLE` 문 생성을 시도합니다. 컬럼 타입 변경 등 복잡한 변경은 여전히 `DROP/CREATE`로 처리될 수 있습니다. **데이터 손실 위험이 있으므로 주의해서 사용하세요.**
 *   `--skip-fk`: FK 마이그레이션을 건너뜁니다.
 *   `--fk-not-valid`: FK를 `NOT VALID`로 추가하고, 검증용 SQL 파일을 별도로 생성합니다.
-*   `--install-extensions` / `--no-install-extensions`: 소스에 존재하지만 타겟에 없는 확장을 감지해 `CREATE EXTENSION`을 추가합니다. 기본값은 활성화이며, allowlist에 포함된 확장만 자동 설치됩니다(현재: `pg_trgm`).
+*   `--install-extensions` / `--no-install-extensions`: 소스에 존재하지만 타겟에 없는 확장을 감지해 `CREATE EXTENSION`을 추가합니다. 기본값은 활성화이며, allowlist에 포함된 확장만 자동 설치됩니다(현재: `pg_trgm`, `postgis`, `vector`).
 
 **실행 예시:**
 
@@ -114,6 +114,11 @@ python -m pg_schema_sync [OPTIONS]
 ## 단계별 실행 스크립트 (대화형)
 
 `migrate_stepwise.py`는 각 단계마다 확인을 받으며 실행합니다.
+FK 제약 오류가 발생하면 `--fk-not-valid` 또는 `--skip-fk`로 재시도할지 묻습니다.
+`--fk-not-valid` 사용 시에는 검증 SQL 파일을 선택해 바로 실행할 수도 있습니다.
+기본적으로 `logs/migrate_stepwise.<timestamp>.log`에 로그를 남기며, `--log-file`로 변경할 수 있습니다.
+마지막에는 스키마 무결성(verify + NOT VALID 제약)과 데이터 무결성(행 수 비교) 체크 여부를 묻습니다.
+마지막에 Gemini 분석 여부를 `S/L/N`으로 선택합니다. 기본은 `S`(요약만 전송)이며, `L`은 요약+로그 끝부분 전송입니다. `--gemini-scope summary_tail`로도 설정할 수 있습니다.
 
 ```bash
 python migrate_stepwise.py --config SupabaseDB2ToLocal.yaml

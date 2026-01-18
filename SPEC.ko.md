@@ -54,7 +54,7 @@ pg-schema-sync [--config <path>] [--verify] [--commit | --no-commit] [--use-alte
 - `--with-data`: 스키마 변경 후 데이터 마이그레이션 실행.
 - `--skip-fk`: FK 마이그레이션을 건너뜀.
 - `--fk-not-valid`: FK를 `NOT VALID`로 추가하고 검증 SQL 파일을 생성.
-- `--install-extensions` / `--no-install-extensions`: 타겟에 없는 확장을 감지해 `CREATE EXTENSION`을 추가(기본값: 활성화, allowlist 기반이며 현재 `pg_trgm`).
+- `--install-extensions` / `--no-install-extensions`: 타겟에 없는 확장을 감지해 `CREATE EXTENSION`을 추가(기본값: 활성화, allowlist 기반이며 현재 `pg_trgm`, `postgis`, `vector`).
 
 출력 파일:
 - `history/migrate.<target>.<timestamp>.sql`
@@ -135,7 +135,8 @@ pg-schema-sync [--config <path>] [--verify] [--commit | --no-commit] [--use-alte
 2. 타겟의 모든 FK 제거(배치 모드, lock timeout 적용).
 3. 테이블별 병렬 데이터 복사:
    - 소스에서 `SELECT *`.
-   - 타겟에 `ON CONFLICT (id) DO NOTHING`으로 `INSERT`.
+   - 타겟에 `ON CONFLICT DO NOTHING`으로 `INSERT`.
+   - 생성 컬럼은 제외하고, `GENERATED ALWAYS` IDENTITY는 `OVERRIDING SYSTEM VALUE`를 사용.
    - `SKIP_TABLES`는 제외.
 4. FK를 `NOT VALID`로 재생성.
 5. 이후 수동 검증을 위한 `validate_fks.sql` 생성.
@@ -177,4 +178,4 @@ CLI 대비 차이점:
 - 타겟 전용 객체는 삭제하지 않습니다.
 - 테이블 기본값 변경은 감지하지 않습니다.
 - 함수 오버로딩은 완전히 지원되지 않습니다(이름 기반 키).
-- 데이터 마이그레이션은 `id`를 충돌 키로 가정합니다.
+- 데이터 마이그레이션은 `id`를 충돌 키로 가정하지 않고 `ON CONFLICT DO NOTHING`을 사용합니다.

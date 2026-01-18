@@ -6,6 +6,7 @@ import datetime # 타임스탬프용
 import os # 디렉토리 생성용
 import argparse # 커맨드라인 인수 처리용
 import re # SQL 정규화용
+import sys
 from collections import defaultdict
 try:
     from .dataMig import run_data_migration_parallel, compare_row_counts
@@ -18,7 +19,7 @@ EXCLUDE_TABLES = ['databasechangelog', 'databasechangeloglock']
 EXCLUDE_INDEXES = ['databasechangeloglock_pkey'] # 필요시 타겟 전용 인덱스 추가
 
 DEFAULT_CONFIG_PATH = "config.yaml"
-AUTO_INSTALL_EXTENSIONS = {"pg_trgm"}
+AUTO_INSTALL_EXTENSIONS = {"pg_trgm", "postgis", "vector"}
 
 # --- DB 연결 함수 ---
 def get_connection(config):
@@ -273,14 +274,14 @@ def fetch_tables_metadata(conn):
     tables_metadata = {}
     for table_name in table_names:
         cur.execute("""
-        SELECT column_name, data_type, is_nullable, udt_name, column_default, is_identity
+        SELECT column_name, data_type, is_nullable, udt_name, column_default, is_identity, identity_generation, is_generated
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = %s
         ORDER BY ordinal_position;
         """, (table_name,))
 
         columns = []
-        for col_name, data_type, is_nullable, udt_name, col_default, is_identity in cur.fetchall():
+        for col_name, data_type, is_nullable, udt_name, col_default, is_identity, identity_generation, is_generated in cur.fetchall():
             col_type = data_type
             if data_type == 'ARRAY':
                 base_type = udt_name.lstrip('_')
@@ -296,7 +297,9 @@ def fetch_tables_metadata(conn):
                 'type': col_type,
                 'nullable': is_nullable == 'YES',
                 'default': col_default,
-                'identity': identity_flag  # 수정된 identity_flag 사용
+                'identity': identity_flag,  # 수정된 identity_flag 사용
+                'identity_generation': identity_generation,
+                'generated': is_generated == 'ALWAYS'
             }
             if (table_name, col_name) in fk_lookup:
                 col_data['foreign_key'] = fk_lookup[(table_name, col_name)]
@@ -533,6 +536,9 @@ def fetch_views(conn):
     cur.execute(query)
     views = {}
     for view_name, view_def in cur.fetchall():
+        if view_def is None:
+            print(f"Warning: view definition not available for {view_name}. Skipping.")
+            continue
         # view_definition은 SELECT 문만 포함하므로 CREATE OR REPLACE VIEW 추가
         # view_definition 끝에 세미콜론이 있을 수 있으므로 제거 후 추가
         ddl = f"CREATE OR REPLACE VIEW public.{view_name} AS\n{view_def.rstrip(';')};"
@@ -669,12 +675,50 @@ def verify_sequence_values(conn, tables_metadata):
                 seq_name = f"{table_name}_{col_name}_seq"
                 
                 try:
+                    # 타겟에 테이블/컬럼/시퀀스가 존재하지 않으면 스킵
+                    cur.execute("""
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = %s
+                    """, (table_name,))
+                    if not cur.fetchone():
+                        print(f"  ⏭️  {table_name}: table not found in target, skipping")
+                        continue
+
+                    cur.execute("""
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = %s AND column_name = %s
+                    """, (table_name, col_name))
+                    if not cur.fetchone():
+                        print(f"  ⏭️  {table_name}.{col_name}: column not found in target, skipping")
+                        continue
+
+                    cur.execute("""
+                    SELECT 1
+                    FROM pg_class c
+                    JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relname = %s
+                    """, (seq_name,))
+                    if not cur.fetchone():
+                        print(f"  ⏭️  {seq_name}: sequence not found in target, skipping")
+                        continue
+
                     # 시퀀스의 last_value 조회
-                    cur.execute(f"SELECT last_value FROM public.{seq_name}")
+                    cur.execute(
+                        sql.SQL("SELECT last_value FROM {}").format(
+                            sql.Identifier("public", seq_name)
+                        )
+                    )
                     seq_last_value = cur.fetchone()[0]
                     
                     # 테이블의 최대 ID 값 조회
-                    cur.execute(f"SELECT COALESCE(MAX({col_name}), 0) FROM public.{table_name}")
+                    cur.execute(
+                        sql.SQL("SELECT COALESCE(MAX({col}), 0) FROM {}").format(
+                            sql.Identifier("public", table_name),
+                            col=sql.Identifier(col_name),
+                        )
+                    )
                     table_max_id = cur.fetchone()[0]
                     
                     print(f"  📊 {table_name}.{col_name}:")
@@ -692,12 +736,16 @@ def verify_sequence_values(conn, tables_metadata):
                         print(f"      Updating sequence value to match table max ID")
                         
                         # 시퀀스 값을 테이블 최대 ID로 업데이트
-                        setval_sql = f"SELECT setval('public.{seq_name}', {table_max_id}, true)"
-                        print(f"      Executing: {setval_sql}")
-                        cur.execute(setval_sql)
+                        setval_sql = "SELECT setval(%s, %s, true)"
+                        print(f"      Executing: SELECT setval('public.{seq_name}', {table_max_id}, true)")
+                        cur.execute(setval_sql, (f"public.{seq_name}", table_max_id))
                         
                         # 업데이트 후 값 확인
-                        cur.execute(f"SELECT last_value FROM public.{seq_name}")
+                        cur.execute(
+                            sql.SQL("SELECT last_value FROM {}").format(
+                                sql.Identifier("public", seq_name)
+                            )
+                        )
                         new_last_value = cur.fetchone()[0]
                         print(f"      After setval: last_value={new_last_value}")
                         print(f"  ✅ {seq_name}: updated from {seq_last_value} to {table_max_id}")
@@ -706,6 +754,7 @@ def verify_sequence_values(conn, tables_metadata):
                     print(f"  ❌ {seq_name}: failed to verify/fix - {e}")
                     import traceback
                     traceback.print_exc()
+                    conn.rollback()
 
 def initialize_sequences_after_migration(src_conn, tgt_conn, src_sequences, src_tables_meta):
     """테이블 마이그레이션 이후에 소스 시퀀스의 last_value로 타겟 시퀀스를 초기화합니다."""
@@ -1843,8 +1892,17 @@ def main():
         tgt_conn = get_connection(target_config)
         
         try:
-            run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks, config_path=config_path)
-            print("\nData migration completed and committed.")
+            failed_tables, table_errors = run_data_migration_parallel(
+                src_conn,
+                src_tables_meta,
+                src_composite_fks,
+                config_path=config_path,
+            )
+            data_migration_failed = bool(failed_tables)
+            if data_migration_failed:
+                print("\nData migration completed with failures.")
+            else:
+                print("\nData migration completed and committed.")
 
             # 데이터 마이그레이션 이후 시퀀스 검증 및 수정 실행
             print(f"\n--- Post-Data Migration Sequence Verification and Correction ---")
@@ -1861,12 +1919,49 @@ def main():
                         seq_name = f"{table_name}_{col_name}_seq"
                         
                         try:
+                            tgt_cur.execute("""
+                            SELECT 1
+                            FROM information_schema.tables
+                            WHERE table_schema = 'public' AND table_name = %s
+                            """, (table_name,))
+                            if not tgt_cur.fetchone():
+                                print(f"  ⏭️  {table_name}: table not found in target, skipping")
+                                continue
+
+                            tgt_cur.execute("""
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public' AND table_name = %s AND column_name = %s
+                            """, (table_name, col_name))
+                            if not tgt_cur.fetchone():
+                                print(f"  ⏭️  {table_name}.{col_name}: column not found in target, skipping")
+                                continue
+
+                            tgt_cur.execute("""
+                            SELECT 1
+                            FROM pg_class c
+                            JOIN pg_namespace n ON c.relnamespace = n.oid
+                            WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relname = %s
+                            """, (seq_name,))
+                            if not tgt_cur.fetchone():
+                                print(f"  ⏭️  {seq_name}: sequence not found in target, skipping")
+                                continue
+
                             # 타겟 시퀀스의 last_value 조회
-                            tgt_cur.execute(f"SELECT last_value FROM public.{seq_name}")
+                            tgt_cur.execute(
+                                sql.SQL("SELECT last_value FROM {}").format(
+                                    sql.Identifier("public", seq_name)
+                                )
+                            )
                             tgt_last_value = tgt_cur.fetchone()[0]
                             
                             # 타겟 테이블의 최대 ID 값 조회 (데이터 마이그레이션 후)
-                            tgt_cur.execute(f"SELECT COALESCE(MAX({col_name}), 0) FROM public.{table_name}")
+                            tgt_cur.execute(
+                                sql.SQL("SELECT COALESCE(MAX({col}), 0) FROM {}").format(
+                                    sql.Identifier("public", table_name),
+                                    col=sql.Identifier(col_name),
+                                )
+                            )
                             tgt_max_id = tgt_cur.fetchone()[0]
                             
                             print(f"  📊 {table_name}.{col_name}:")
@@ -1884,12 +1979,16 @@ def main():
                                 print(f"      Updating sequence value to match table max ID")
                                 
                                 # 시퀀스 값을 테이블 최대 ID로 업데이트
-                                setval_sql = f"SELECT setval('public.{seq_name}', {tgt_max_id}, true)"
-                                print(f"      Executing: {setval_sql}")
-                                tgt_cur.execute(setval_sql)
+                                setval_sql = "SELECT setval(%s, %s, true)"
+                                print(f"      Executing: SELECT setval('public.{seq_name}', {tgt_max_id}, true)")
+                                tgt_cur.execute(setval_sql, (f"public.{seq_name}", tgt_max_id))
                                 
                                 # 업데이트 후 값 확인
-                                tgt_cur.execute(f"SELECT last_value FROM public.{seq_name}")
+                                tgt_cur.execute(
+                                    sql.SQL("SELECT last_value FROM {}").format(
+                                        sql.Identifier("public", seq_name)
+                                    )
+                                )
                                 new_last_value = tgt_cur.fetchone()[0]
                                 print(f"      After setval: last_value={new_last_value}")
                                 print(f"  ✅ {seq_name}: updated from {tgt_last_value} to {tgt_max_id}")
@@ -1898,6 +1997,7 @@ def main():
                             print(f"  ❌ {seq_name}: failed to verify/correct - {e}")
                             import traceback
                             traceback.print_exc()
+                            tgt_conn.rollback()
             
             # 명시적 시퀀스 값 검증 및 수정 (소스에 명시적 시퀀스가 있는 경우)
             common_sequences = set(src_sequences.keys()) & set(tgt_sequences.keys())
@@ -1913,7 +2013,11 @@ def main():
                             src_last_value, src_is_called = src_cur.fetchone()
                             
                             # 타겟 시퀀스의 현재 값 조회
-                            tgt_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+                            tgt_cur.execute(
+                                sql.SQL("SELECT last_value, is_called FROM {}").format(
+                                    sql.Identifier("public", seq_name)
+                                )
+                            )
                             tgt_last_value, tgt_is_called = tgt_cur.fetchone()
                             
                             print(f"  📊 {seq_name}:")
@@ -1923,12 +2027,16 @@ def main():
                             # 값이 다른 경우에만 업데이트
                             if src_last_value != tgt_last_value:
                                 # 시퀀스 값을 소스와 동일하게 설정
-                                setval_sql = f"SELECT setval('public.{seq_name}', {src_last_value}, {src_is_called})"
-                                print(f"    Executing: {setval_sql}")
-                                tgt_cur.execute(setval_sql)
+                                setval_sql = "SELECT setval(%s, %s, %s)"
+                                print(f"    Executing: SELECT setval('public.{seq_name}', {src_last_value}, {src_is_called})")
+                                tgt_cur.execute(setval_sql, (f"public.{seq_name}", src_last_value, src_is_called))
                                 
                                 # 업데이트 후 값 확인
-                                tgt_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
+                                tgt_cur.execute(
+                                    sql.SQL("SELECT last_value, is_called FROM {}").format(
+                                        sql.Identifier("public", seq_name)
+                                    )
+                                )
                                 new_tgt_last_value, new_tgt_is_called = tgt_cur.fetchone()
                                 print(f"    After setval: last_value={new_tgt_last_value}, is_called={new_tgt_is_called}")
                                 
@@ -1940,6 +2048,7 @@ def main():
                             print(f"  ❌ {seq_name}: failed to verify/correct - {e}")
                             import traceback
                             traceback.print_exc()
+                            tgt_conn.rollback()
             
             tgt_conn.commit()
             print("\nSequence verification and correction completed and committed.")
@@ -1947,6 +2056,10 @@ def main():
             # 최종 시퀀스 값 검증
             print(f"\n--- Final Sequence Value Verification ---")
             verify_sequence_values(tgt_conn, src_tables_meta)
+
+            if data_migration_failed:
+                print("Data migration finished with failures.")
+                sys.exit(2)
 
         except Exception as e:
             print(f"Error during data migration: {e}")
@@ -2029,6 +2142,7 @@ def main():
                     src_conn.close()
                     tgt_conn.close()
                     print("Connections closed.")
+                    sys.exit(1)
                     
             except Exception as e:
                 print(f"\nAn unexpected error occurred during SQL execution: {e}")
@@ -2038,6 +2152,7 @@ def main():
                 src_conn.close()
                 tgt_conn.close()
                 print("Connections closed.")
+                sys.exit(1)
 
     # --- SQL 실행 끝 ---
 

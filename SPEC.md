@@ -54,7 +54,7 @@ Flags:
 - `--with-data`: run data migration after schema changes.
 - `--skip-fk`: skip foreign key migration.
 - `--fk-not-valid`: add foreign keys as `NOT VALID` and emit a validation SQL file.
-- `--install-extensions` / `--no-install-extensions`: detect missing extensions on target and add `CREATE EXTENSION` statements (default: enabled; allowlist-limited, currently `pg_trgm`).
+- `--install-extensions` / `--no-install-extensions`: detect missing extensions on target and add `CREATE EXTENSION` statements (default: enabled; allowlist-limited, currently `pg_trgm`, `postgis`, `vector`).
 
 Output files:
 - `history/migrate.<target>.<timestamp>.sql`
@@ -135,7 +135,8 @@ Workflow:
 2. Drop all FK constraints in the target (batch mode, lock timeout).
 3. Copy data table-by-table in parallel:
    - `SELECT *` from source.
-   - `INSERT` into target with `ON CONFLICT (id) DO NOTHING`.
+   - `INSERT` into target with `ON CONFLICT DO NOTHING`.
+   - Generated columns are skipped; identity `GENERATED ALWAYS` columns use `OVERRIDING SYSTEM VALUE`.
    - Tables in `SKIP_TABLES` are skipped.
 4. Recreate FKs as `NOT VALID`.
 5. Generate `validate_fks.sql` for later manual validation.
@@ -177,4 +178,4 @@ Differences vs CLI:
 - Target-only objects are not dropped.
 - Table default changes are not detected.
 - Function overloading is not fully supported (functions keyed by name).
-- Data migration assumes a conflict target on `id`.
+- Data migration uses `ON CONFLICT DO NOTHING` and does not assume an `id` column.

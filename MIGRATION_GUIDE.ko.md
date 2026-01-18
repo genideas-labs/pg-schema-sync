@@ -56,6 +56,12 @@ targets:
 python migrate_stepwise.py --config SupabaseDB2ToLocal.yaml
 ```
 
+FK 제약 오류가 발생하면 스크립트가 `--fk-not-valid` 또는 `--skip-fk`로 재시도할지 안내합니다.
+`--fk-not-valid` 사용 시에는 생성된 `validate_fks.*.sql`을 선택해 검증까지 진행할 수 있습니다.
+기본 로그 파일은 `logs/migrate_stepwise.<timestamp>.log`이며, `--log-file`로 경로를 지정할 수 있습니다.
+마지막 단계에서 스키마 무결성(verify + NOT VALID 제약)과 데이터 무결성(행 수 비교) 체크 여부를 묻습니다.
+마지막에 Gemini 분석 여부를 `S/L/N`으로 선택합니다. 기본은 `S`(요약만 전송)이며, `L`은 요약+로그 끝부분 전송입니다. `--gemini-scope summary_tail`로도 설정할 수 있습니다.
+
 ### 검증 및 연결확인 (변경 없이 차이점 확인)
 
 ```bash
@@ -72,7 +78,7 @@ python src/pg_schema_sync/__main__.py --commit
 
 ```
 
-> 참고: 소스에 존재하지만 타겟에 없는 확장은 allowlist(기본: `pg_trgm`)에 한해 자동으로 `CREATE EXTENSION`이 포함됩니다.  
+> 참고: 소스에 존재하지만 타겟에 없는 확장은 allowlist(기본: `pg_trgm`, `postgis`, `vector`)에 한해 자동으로 `CREATE EXTENSION`이 포함됩니다.  
 > 자동 설치를 끄려면 `--no-install-extensions`를 사용하세요.
 
 ### FK를 나중에 검증하고 싶은 경우 (NOT VALID)

@@ -24,23 +24,95 @@ def migrate_single_table_with_conn(src_conn, tgt_conn, table_name, table_meta):
                 return True, None
 
             column_names = [desc[0] for desc in src_cur.description]
-            quoted_column_names = [f'"{col}"' for col in column_names]
-            values_placeholders = ", ".join(["%s"] * len(column_names))
-
-            conflict_clause = "ON CONFLICT (id) DO NOTHING"
-
+            column_meta = {col['name']: col for col in table_meta}
             column_type_map = {col['name']: col['type'] for col in table_meta}
+
+            tgt_cur.execute("""
+            SELECT column_name, is_generated, data_type, udt_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            """, (table_name,))
+            target_columns = {}
+            for col_name, is_generated, data_type, udt_name in tgt_cur.fetchall():
+                if data_type == 'ARRAY':
+                    base_type = udt_name.lstrip('_')
+                    col_type = base_type + '[]'
+                else:
+                    col_type = data_type
+                target_columns[col_name] = {
+                    "is_generated": is_generated,
+                    "type": col_type,
+                }
+
+            selected_columns = []
+            selected_indexes = []
+            skipped_columns = []
+            target_type_map = {}
+            json_mismatch_columns = []
+            for idx, col_name in enumerate(column_names):
+                target_info = target_columns.get(col_name)
+                if target_info is None:
+                    skipped_columns.append(col_name)
+                    continue
+                if target_info["is_generated"] == 'ALWAYS' or column_meta.get(col_name, {}).get("generated"):
+                    skipped_columns.append(col_name)
+                    continue
+                target_type = target_info["type"]
+                target_type_map[col_name] = target_type
+                source_type = column_type_map.get(col_name)
+                if target_type in ("json", "jsonb") and source_type not in ("json", "jsonb"):
+                    json_mismatch_columns.append(
+                        f"{col_name} ({source_type or 'unknown'} -> {target_type})"
+                    )
+                selected_columns.append(col_name)
+                selected_indexes.append(idx)
+
+            if skipped_columns:
+                print(f"  ℹ️  {table_name}: Skipping columns: {', '.join(skipped_columns)}", flush=True)
+            if json_mismatch_columns:
+                print(
+                    f"  ⚠️  {table_name}: JSON type mismatch detected: {', '.join(json_mismatch_columns)}",
+                    flush=True,
+                )
+                print(
+                    "     EN: Values will be serialized to JSON to avoid insert errors.",
+                    flush=True,
+                )
+                print(
+                    "     KO: 삽입 오류 방지를 위해 값을 JSON으로 직렬화합니다.",
+                    flush=True,
+                )
+
+            if not selected_columns:
+                print(f"  ⏭️  {table_name}: No insertable columns, skipped", flush=True)
+                return True, None
+
+            quoted_column_names = [f'"{col}"' for col in selected_columns]
+            values_placeholders = ", ".join(["%s"] * len(selected_columns))
+
+            conflict_clause = "ON CONFLICT DO NOTHING"
+
+            override_identity = any(
+                column_meta.get(col_name, {}).get("identity_generation") == "ALWAYS"
+                for col_name in selected_columns
+            )
+            override_clause = "OVERRIDING SYSTEM VALUE" if override_identity else ""
 
             insert_sql = f'''
                 INSERT INTO public."{table_name}" ({", ".join(quoted_column_names)})
+                {override_clause}
                 VALUES ({values_placeholders})
                 {conflict_clause}
             '''
 
             serialized_rows = [
                 tuple(
-                    serialize_value(val, column_type_map.get(col_name))
-                    for val, col_name in zip(row, column_names)
+                    serialize_value(
+                        row[idx],
+                        column_type_map.get(col_name),
+                        target_type_map.get(col_name),
+                    )
+                    for idx, col_name in zip(selected_indexes, selected_columns)
                 )
                 for row in rows
             ]
@@ -56,7 +128,25 @@ def migrate_single_table_with_conn(src_conn, tgt_conn, table_name, table_meta):
         print(f"  ❌ {table_name}: {type(e).__name__}: {str(e)}", flush=True)
         return False, str(e)
 
-def serialize_value(val, pg_type=None):
+def serialize_json_value(val):
+    if val is None:
+        return None
+    if isinstance(val, set):
+        val = list(val)
+    if isinstance(val, bytes):
+        val = val.decode("utf-8", errors="replace")
+    if isinstance(val, str):
+        try:
+            json.loads(val)
+            return val
+        except Exception:
+            return json.dumps(val)
+    return json.dumps(val)
+
+
+def serialize_value(val, pg_type=None, target_type=None):
+    if target_type in ("json", "jsonb"):
+        return serialize_json_value(val)
     if isinstance(val, list):
         if pg_type and (pg_type.endswith('[]') or pg_type.startswith('_')):
             if not val:
@@ -254,16 +344,16 @@ def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=Non
             config = yaml.safe_load(stream)
             if not config:
                 print(f"Error: {config_path} is empty or invalid.")
-                return
+                return [], {}
     except FileNotFoundError:
         print(f"Error: {config_path} not found.")
-        return
+        return [], {}
     except yaml.YAMLError as exc:
         print(f"Error parsing {config_path}: {exc}")
-        return
+        return [], {}
     except Exception as e:
         print(f"An unexpected error occurred while reading {config_path}: {e}")
-        return
+        return [], {}
     target_config = config['targets']['gcp_test'].copy()
     source_config = config['source'].copy()
 
@@ -382,6 +472,7 @@ def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=Non
     else:
         print("\n✅ All tables migrated successfully.")
         print("✅ 데이터 마이그레이션 완료")
+    return remaining_tables, table_errors
     
     
 

@@ -20,8 +20,8 @@ classifiers = [
     "Topic :: Software Development :: Version Control :: Schema Migration",
 ]
 dependencies = [
-    "psycopg2-binary",
-    "PyYAML",
+    "psycopg2-binary>=2.9.10,<3.0",
+    "PyYAML>=6.0.2,<7.0",
 ]
 
 [project.urls]
@@ -34,13 +34,16 @@ pg-schema-sync = "pg_schema_sync.__main__:main"
 [project.optional-dependencies]
 mcp = [
     "modelcontextprotocol-sdk",
-    "PyYAML", # Already in core deps, but good for clarity if MCP feature relies on it
+    "PyYAML>=6.0.2,<7.0", # Already in core deps, but good for clarity if MCP feature relies on it
 ]
 dev = [
-    "pytest",
+    "pytest>=8.4.1,<9.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = [
   "src"
+]
+markers = [
+  "smoke: live DB connectivity tests (requires PG_SCHEMA_SYNC_SMOKE_CONFIG)",
 ]

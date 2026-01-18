@@ -4,6 +4,8 @@ SupabaseDB1ToLocal.yaml
 SupabaseDB2ToLocal.yaml
 GCPDB1ToLocal.yaml
 GCPDB2ToLocal.yaml
+logs/
+validate_fks.sql
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -136,6 +138,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.development
 .venv
 env/
 venv/

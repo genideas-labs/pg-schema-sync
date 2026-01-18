@@ -8,7 +8,7 @@ source:
 targets:
   gcp_test:
     host: 127.0.0.1
-    port: 5432
+    port: 54322
     db: postgres
     username: postgres
     password: postgres

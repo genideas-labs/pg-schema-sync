@@ -1,0 +1,14 @@
+source:
+  host: SUPABASE_DB1_HOST
+  port: 5432
+  db: postgres
+  username: SUPABASE_DB1_USER
+  password: SUPABASE_DB1_PASSWORD
+
+targets:
+  gcp_test:
+    host: 127.0.0.1
+    port: 5432
+    db: postgres
+    username: postgres
+    password: postgres

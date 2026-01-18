@@ -113,7 +113,7 @@ def test_compare_tables_unsafe_type_change_no_alter():
     assert not skip_sql
     assert len(mig_sql) == 1
     assert "DROP TABLE IF EXISTS public.my_table CASCADE;" in mig_sql[0]
-    assert "CREATE TABLE public.my_table" in mig_sql[0]
+    assert "CREATE TABLE public.\"my_table\"" in mig_sql[0]
     assert "ALTER TABLE" not in mig_sql[0]
 
 
@@ -147,7 +147,7 @@ def test_compare_tables_varchar_decrease_no_alter():
     assert not skip_sql
     assert len(mig_sql) == 1
     assert "DROP TABLE IF EXISTS public.my_table CASCADE;" in mig_sql[0]
-    assert "CREATE TABLE public.my_table" in mig_sql[0]
+    assert "CREATE TABLE public.\"my_table\"" in mig_sql[0]
     assert "ALTER TABLE" not in mig_sql[0]
 
 def test_compare_tables_varchar_to_text_with_alter():
@@ -213,7 +213,7 @@ def test_compare_tables_add_and_unsafe_type_change():
     assert not skip_sql
     assert len(mig_sql) == 1
     assert "DROP TABLE IF EXISTS public.my_table CASCADE;" in mig_sql[0]
-    assert "CREATE TABLE public.my_table" in mig_sql[0]
+    assert "CREATE TABLE public.\"my_table\"" in mig_sql[0]
     assert "ALTER TABLE" not in mig_sql[0]
 
 def test_compare_tables_drop_and_null_change():
@@ -279,7 +279,7 @@ def test_compare_tables_add_column_without_alter():
     assert not skip_sql # 스킵 SQL은 없어야 함
     assert len(mig_sql) == 1
     assert "DROP TABLE IF EXISTS public.my_table CASCADE;" in mig_sql[0]
-    assert "CREATE TABLE public.my_table" in mig_sql[0]
+    assert "CREATE TABLE public.\"my_table\"" in mig_sql[0]
     assert "ALTER TABLE" not in mig_sql[0]
 
 # --- 추가 테스트 케이스 ---
@@ -358,5 +358,5 @@ def test_compare_tables_completely_different(): # 이제 버그 수정으로 DRO
     assert len(mig_sql) == 1
     # 컬럼이 완전히 다르므로 needs_recreate=True가 되어 DROP/CREATE 발생 예상
     assert "DROP TABLE IF EXISTS public.my_table CASCADE;" in mig_sql[0]
-    assert "CREATE TABLE public.my_table" in mig_sql[0]
+    assert "CREATE TABLE public.\"my_table\"" in mig_sql[0]
     assert "ALTER TABLE" not in mig_sql[0]

@@ -10,10 +10,11 @@ pg-schema-sync compares a source and target PostgreSQL schema (public schema onl
 - Data migration engine: `src/pg_schema_sync/dataMig.py`.
 - MCP wrapper: `mcp_server/index.py`.
 - Ops helpers: `check_connections.py`, `kill_idle_transactions.py`, `kill_zombie_connections.py`, `kill_others.sh`, `migrate_clean.sh`.
+- Stepwise runner: `migrate_stepwise.py`.
 - Tests: `tests/` (unit tests for compare logic).
 
 ## 3. Configuration
-CLI reads `config.yaml` from the current working directory.
+CLI reads `config.yaml` from the current working directory by default or accepts `--config <path>` for an alternate file.
 
 Expected shape:
 ```yaml
@@ -41,19 +42,24 @@ Notes:
 ## 4. CLI Interface
 Command:
 ```
-pg-schema-sync [--verify] [--commit | --no-commit] [--use-alter] [--with-data]
+pg-schema-sync [--config <path>] [--verify] [--commit | --no-commit] [--use-alter] [--with-data] [--skip-fk | --fk-not-valid] [--install-extensions | --no-install-extensions]
 ```
 
 Flags:
+- `--config <path>`: use a non-default config file.
 - `--verify`: only reports object name differences (no SQL generation, no execution).
 - `--commit` (default): generate SQL and apply changes to target (committed per DDL block).
 - `--no-commit`: generate SQL files only; no changes applied.
 - `--use-alter` (experimental): use `ALTER TABLE` for safe column changes, otherwise drop/recreate.
 - `--with-data`: run data migration after schema changes.
+- `--skip-fk`: skip foreign key migration.
+- `--fk-not-valid`: add foreign keys as `NOT VALID` and emit a validation SQL file.
+- `--install-extensions` / `--no-install-extensions`: detect missing extensions on target and add `CREATE EXTENSION` statements (default: enabled; allowlist-limited, currently `pg_trgm`).
 
 Output files:
 - `history/migrate.<target>.<timestamp>.sql`
 - `history/skip.<target>.<timestamp>.sql`
+- `history/validate_fks.<target>.<timestamp>.sql` (only when `--fk-not-valid` is used)
 
 ## 5. Schema Comparison Model
 All queries are scoped to `public` schema.
@@ -114,6 +120,7 @@ When `--use-alter` is set:
 ### 6.7 Foreign keys
 - Generated from `pg_constraint` with composite key support.
 - Migration only adds missing/different constraints; it does not drop existing FKs.
+- `--fk-not-valid` appends `NOT VALID` and emits a validation SQL file for later execution.
 
 ### 6.8 Sequences
 - Identity sequences are excluded from compare.

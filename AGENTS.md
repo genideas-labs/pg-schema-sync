@@ -8,6 +8,7 @@ Guidance for automated agents working in this repository.
 - `mcp_server/index.py`: MCP wrapper server and tool definitions.
 - `tests/`: unit tests for compare logic (enums/tables/views/functions/indexes).
 - `check_connections.py`, `kill_idle_transactions.py`, `kill_zombie_connections.py`, `kill_others.sh`, `migrate_clean.sh`, `migrate_single_table.py`: operational helpers.
+- `migrate_stepwise.py`: interactive stepwise runner for schema migration.
 - `README.md`, `MIGRATION_GUIDE.md`, `testing.md`: user-facing docs.
 
 ## Runtime behavior to keep in mind

@@ -65,7 +65,8 @@ def serialize_value(val, pg_type=None):
             for v in val:
                 if isinstance(v, str):
                     # 문자열 원소일 경우 이스케이프
-                    escaped_items.append(f'"{v.replace(chr(34), r"\\\"")}"')
+                    escaped = v.replace('"', '\\"')
+                    escaped_items.append(f'"{escaped}"')
                 elif isinstance(v, dict):
                     # dict → JSON 문자열 → 다시 이스케이프
                     json_str = json.dumps(v).replace('"', r'\"')
@@ -236,7 +237,7 @@ def generate_validate_script(fks, output_file='validate_fks.sql'):
     print(f"✅ VALIDATE script generated: {output_file}", flush=True)
     print(f"   Run this script later with: psql -f {output_file}\n", flush=True)
 
-def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=None, max_total_attempts=10):
+def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=None, max_total_attempts=10, config_path="config.yaml"):
     # FK 의존성 정렬이 필요 없음 - FK를 미리 DROP하므로
     print("\n--- Starting Parallel Data Migration ---")
     print(f"Total tables to migrate: {len(src_tables_meta)}")
@@ -249,22 +250,32 @@ def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=Non
 
     table_errors = defaultdict(str)
     try:
-        with open("config.yaml", 'r', encoding='utf-8') as stream:
+        with open(config_path, 'r', encoding='utf-8') as stream:
             config = yaml.safe_load(stream)
             if not config:
-                print("Error: config.yaml is empty or invalid.")
+                print(f"Error: {config_path} is empty or invalid.")
                 return
     except FileNotFoundError:
-        print("Error: config.yaml not found.")
+        print(f"Error: {config_path} not found.")
         return
     except yaml.YAMLError as exc:
-        print(f"Error parsing config.yaml: {exc}")
+        print(f"Error parsing {config_path}: {exc}")
         return
     except Exception as e:
-        print(f"An unexpected error occurred while reading config.yaml: {e}")
+        print(f"An unexpected error occurred while reading {config_path}: {e}")
         return
-    target_config = config['targets']['gcp_test']
-    source_config = config['source']
+    target_config = config['targets']['gcp_test'].copy()
+    source_config = config['source'].copy()
+
+    if 'db' in source_config:
+        source_config['dbname'] = source_config.pop('db')
+    if 'username' in source_config:
+        source_config['user'] = source_config.pop('username')
+
+    if 'db' in target_config:
+        target_config['dbname'] = target_config.pop('db')
+    if 'username' in target_config:
+        target_config['user'] = target_config.pop('username')
     
     # 연결 풀 생성 (병렬 처리용)
     MAX_WORKERS = 5

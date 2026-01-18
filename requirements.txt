@@ -1,2 +1,2 @@
-psycopg2-binary
-PyYAML
+psycopg2-binary>=2.9.10,<3.0
+PyYAML>=6.0.2,<7.0

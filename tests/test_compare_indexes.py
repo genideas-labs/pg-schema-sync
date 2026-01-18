@@ -22,8 +22,10 @@ def test_compare_indexes_definition_changed():
     assert "-- INDEX idx_users_on_email is up-to-date; skipping." in skip_sql[0]
     # idx_orders_on_user_id는 변경되어야 함
     assert len(mig_sql) == 1
-    assert "DROP INDEX IF EXISTS public.idx_orders_on_user_id CASCADE;" in mig_sql[0]
+    assert "DO $$" in mig_sql[0]
+    assert "IF NOT EXISTS" in mig_sql[0]
     assert "CREATE INDEX idx_orders_on_user_id ON public.orders USING btree (user_id);" in mig_sql[0] # 소스 기준 DDL
+    assert "DROP INDEX" not in mig_sql[0]
 
 def test_compare_indexes_no_change():
     """Index 변경 없을 때 스킵 확인"""

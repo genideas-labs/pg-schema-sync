@@ -7,17 +7,68 @@ import os # 디렉토리 생성용
 import argparse # 커맨드라인 인수 처리용
 import re # SQL 정규화용
 from collections import defaultdict
-from dataMig import run_data_migration_parallel, compare_row_counts
+try:
+    from .dataMig import run_data_migration_parallel, compare_row_counts
+except ImportError:
+    from dataMig import run_data_migration_parallel, compare_row_counts
 # --- 제외할 객체 목록 ---
 # Liquibase 등 마이그레이션 도구 관련 테이블 또는 기타 제외 대상
 EXCLUDE_TABLES = ['databasechangelog', 'databasechangeloglock']
 # 관련 인덱스 또는 기타 제외 대상
 EXCLUDE_INDEXES = ['databasechangeloglock_pkey'] # 필요시 타겟 전용 인덱스 추가
 
+DEFAULT_CONFIG_PATH = "config.yaml"
+AUTO_INSTALL_EXTENSIONS = {"pg_trgm"}
+
 # --- DB 연결 함수 ---
 def get_connection(config):
     conn = psycopg2.connect(**config)
     return conn
+
+def load_config(config_path):
+    """Load config YAML from a given path."""
+    try:
+        with open(config_path, 'r', encoding='utf-8') as stream:
+            config = yaml.safe_load(stream)
+            if not config:
+                print(f"Error: {config_path} is empty or invalid.")
+                return None
+            return config
+    except FileNotFoundError:
+        print(f"Error: {config_path} not found.")
+        return None
+    except yaml.YAMLError as exc:
+        print(f"Error parsing {config_path}: {exc}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred while reading {config_path}: {e}")
+        return None
+
+def fetch_extensions(conn):
+    """Fetch installed extensions from the connected database."""
+    cur = conn.cursor()
+    cur.execute("SELECT extname FROM pg_extension;")
+    extensions = {row[0] for row in cur.fetchall()}
+    cur.close()
+    return extensions
+
+def get_extension_diffs(src_conn, tgt_conn, allowlist=None):
+    """Return missing extensions and those skipped by allowlist."""
+    src_exts = fetch_extensions(src_conn)
+    tgt_exts = fetch_extensions(tgt_conn)
+    missing = src_exts - tgt_exts
+    if allowlist is None:
+        return sorted(missing), []
+    allowed_missing = sorted(missing & allowlist)
+    skipped_missing = sorted(missing - allowlist)
+    return allowed_missing, skipped_missing
+
+def build_extension_sql(extensions):
+    """Build CREATE EXTENSION statements."""
+    return [
+        f"-- EXTENSION {ext}\nCREATE EXTENSION IF NOT EXISTS {ext};\n"
+        for ext in extensions
+    ]
 
 # --- Enum DDL 조회 ---
 def fetch_enums(conn):
@@ -939,12 +990,14 @@ def is_safe_type_change(old_type, new_type):
 # --- 비교 후 migration SQL 생성 (타입별 로직 분기, Enum DDL 참조 추가, ALTER TABLE 지원 추가) ---
 def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=None, use_alter=False,
                                  src_composite_uniques=None, tgt_composite_uniques=None,
-                                 src_composite_primaries=None, tgt_composite_primaries=None):
+                                 src_composite_primaries=None, tgt_composite_primaries=None,
+                                 fk_not_valid=False):
     """
     소스와 타겟 데이터를 비교하여 마이그레이션 SQL과 건너뛴 SQL을 생성합니다.
     obj_type에 따라 비교 방식을 다르게 적용합니다.
     use_alter=True일 경우, 테이블 컬럼 추가/삭제에 대해 ALTER TABLE 사용 시도.
     Enum 타입의 DDL 생성을 위해 src_enum_ddls 딕셔너리가 필요합니다.
+    fk_not_valid=True이면 FOREIGN KEY를 NOT VALID로 생성합니다.
     """
     migration_sql = []
     skipped_sql = []
@@ -1013,6 +1066,8 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                     """.strip()    
         else: # View, Function, Index 등
             ddl = src_data.get(name, f"-- ERROR: DDL not found for {obj_type} {name}")
+        if obj_type == "FOREIGN_KEY" and fk_not_valid:
+            ddl = add_not_valid_constraint(ddl)
         migration_sql.append(f"-- CREATE {obj_type} {name}\n{ddl}\n")
 
     # 양쪽에 모두 있는 객체 비교 처리
@@ -1196,6 +1251,8 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                     ddl = src_data[name]
 
             if are_different:
+                if fk_not_valid:
+                    ddl = add_not_valid_constraint(ddl)
                 # ✅ DROP 없이 추가만 시도
                 migration_sql.append(f"-- FOREIGN_KEY {name} differs or missing. Adding.\n{ddl}\n")
             else:
@@ -1413,9 +1470,40 @@ def extract_foreign_keys(metadata, composite_fks):
     
     return fk_map
 
+def add_not_valid_constraint(ddl):
+    """Append NOT VALID to a FK constraint if not already present."""
+    if "NOT VALID" in ddl.upper():
+        return ddl
+    stripped = ddl.rstrip()
+    if stripped.endswith(";"):
+        return stripped[:-1] + " NOT VALID;"
+    return stripped + " NOT VALID"
+
+def build_fk_validate_statements(migration_sql_blocks):
+    """Build VALIDATE CONSTRAINT statements from FK migration blocks."""
+    validate_sql = []
+    pattern = re.compile(
+        r'ALTER\\s+TABLE\\s+public\\."?([^"\\s]+)"?\\s+ADD\\s+CONSTRAINT\\s+"?([^"\\s]+)"?',
+        re.IGNORECASE,
+    )
+    for block in migration_sql_blocks:
+        sql_content = "\n".join(
+            line for line in block.splitlines() if not line.strip().startswith("--")
+        )
+        match = pattern.search(sql_content)
+        if not match:
+            continue
+        table_name, constraint_name = match.groups()
+        validate_sql.append(
+            f'ALTER TABLE public."{table_name}" VALIDATE CONSTRAINT "{constraint_name}";'
+        )
+    return validate_sql
+
 def main():
     # --- 커맨드라인 인수 파싱 ---
     parser = argparse.ArgumentParser(description="Compare source and target PostgreSQL schemas and generate/apply migration SQL, or verify differences.")
+    parser.add_argument('--config', default=DEFAULT_CONFIG_PATH,
+                        help=f"Path to config YAML file (default: {DEFAULT_CONFIG_PATH}).")
     # Verification flag
     parser.add_argument('--verify', action='store_true',
                         help="Only verify schema differences (object names and counts) without generating/executing SQL.")
@@ -1427,8 +1515,17 @@ def main():
                         help="EXPERIMENTAL: Use ALTER TABLE for column additions/deletions instead of DROP/CREATE. Use with caution.")
     parser.add_argument('--with-data', action='store_true',
                     help="Include data migration after schema changes")
+    parser.add_argument('--skip-fk', action='store_true', default=False,
+                        help="Skip foreign key migration.")
+    parser.add_argument('--fk-not-valid', action='store_true', default=False,
+                        help="Add foreign keys as NOT VALID and write a validate SQL file.")
+    parser.add_argument('--install-extensions', action=argparse.BooleanOptionalAction, default=True,
+                        help="Detect missing extensions and add CREATE EXTENSION statements (default: enabled).")
     args = parser.parse_args()
     # --- 인수 파싱 끝 ---
+    if args.skip_fk and args.fk_not_valid:
+        print("Error: --skip-fk and --fk-not-valid are mutually exclusive.")
+        return
 
     # 타임스탬프 생성 (YYYYMMDDHHMMSS 형식)
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -1437,29 +1534,17 @@ def main():
     history_dir = "history"
     os.makedirs(history_dir, exist_ok=True)
 
-    # config.yaml 파일 로드
-    try:
-        with open("config.yaml", 'r', encoding='utf-8') as stream:
-            config = yaml.safe_load(stream)
-            if not config:
-                print("Error: config.yaml is empty or invalid.")
-                return
-    except FileNotFoundError:
-        print("Error: config.yaml not found.")
-        return
-    except yaml.YAMLError as exc:
-        print(f"Error parsing config.yaml: {exc}")
-        return
-    except Exception as e:
-        print(f"An unexpected error occurred while reading config.yaml: {e}")
+    config_path = args.config
+    config = load_config(config_path)
+    if not config:
         return
 
     # 설정 유효성 검사 및 추출
     if 'source' not in config or not isinstance(config['source'], dict):
-        print("Error: 'source' configuration is missing or invalid in config.yaml.")
+        print(f"Error: 'source' configuration is missing or invalid in {config_path}.")
         return
     if 'targets' not in config or not isinstance(config['targets'], dict) or 'gcp_test' not in config['targets'] or not isinstance(config['targets']['gcp_test'], dict):
-        print("Error: 'targets.gcp_test' configuration is missing or invalid in config.yaml.")
+        print(f"Error: 'targets.gcp_test' configuration is missing or invalid in {config_path}.")
         return
 
     source_config = config['source']
@@ -1491,6 +1576,28 @@ def main():
     except Exception as e:
         print(f"An unexpected error occurred during connection: {e}")
         return
+
+    extension_migration_sql = []
+    if args.verify:
+        missing_extensions, _ = get_extension_diffs(src_conn, tgt_conn, allowlist=None)
+        if missing_extensions:
+            print(f"Missing extensions in target database: {', '.join(missing_extensions)}")
+    else:
+        allowed_missing, skipped_missing = get_extension_diffs(
+            src_conn,
+            tgt_conn,
+            allowlist=AUTO_INSTALL_EXTENSIONS,
+        )
+        if skipped_missing:
+            print("Warning: Missing extensions not in allowlist; install manually:")
+            print(f"  {', '.join(skipped_missing)}")
+        if allowed_missing:
+            if args.install_extensions:
+                print(f"Adding extension setup for: {', '.join(allowed_missing)}")
+                extension_migration_sql = build_extension_sql(allowed_missing)
+            else:
+                print("Missing extensions detected (auto-install disabled):")
+                print(f"  {', '.join(allowed_missing)}")
 
 
     # --- 데이터 조회 ---
@@ -1606,6 +1713,10 @@ def main():
     all_migration_sql = [] # 실제 마이그레이션 SQL 저장
     all_skipped_sql = []   # 건너뛴 SQL 저장
 
+    if extension_migration_sql:
+        all_migration_sql.extend(extension_migration_sql)
+    fk_validate_sql = []
+
     # 순서: enum, table, sequence, view, function, index
     print("Comparing Enums (Values)...")
     # Enum 비교 시 값 목록(values)을 사용하고, DDL 생성을 위해 src_enum_ddls 전달
@@ -1639,14 +1750,24 @@ def main():
         # all_migration_sql.extend(mig_sql)
         # all_skipped_sql.extend(skip_sql)
 
-    print("Comparing Foreign Keys...")  # 👈 이 부분 추가
+    if args.skip_fk:
+        print("Skipping Foreign Keys (--skip-fk enabled)...")
+    else:
+        print("Comparing Foreign Keys...")  # 👈 이 부분 추가
 
-    src_fk_map = extract_foreign_keys(src_tables_meta, src_composite_fks)
-    tgt_fk_map = extract_foreign_keys(tgt_tables_meta, tgt_composite_fks)
+        src_fk_map = extract_foreign_keys(src_tables_meta, src_composite_fks)
+        tgt_fk_map = extract_foreign_keys(tgt_tables_meta, tgt_composite_fks)
 
-    mig_sql, skip_sql = compare_and_generate_migration(src_fk_map, tgt_fk_map, "FOREIGN_KEY")
-    all_migration_sql.extend(mig_sql)
-    all_skipped_sql.extend(skip_sql)
+        mig_sql, skip_sql = compare_and_generate_migration(
+            src_fk_map,
+            tgt_fk_map,
+            "FOREIGN_KEY",
+            fk_not_valid=args.fk_not_valid,
+        )
+        all_migration_sql.extend(mig_sql)
+        all_skipped_sql.extend(skip_sql)
+        if args.fk_not_valid:
+            fk_validate_sql = build_fk_validate_statements(mig_sql)
 
     print("Comparing Views (DDL)...")
     mig_sql, skip_sql = compare_and_generate_migration(src_views, tgt_views, "VIEW")
@@ -1691,6 +1812,17 @@ def main():
     except IOError as e:
         print(f"Error writing skipped file {skipped_filename}: {e}")
 
+    if args.fk_not_valid and fk_validate_sql:
+        validate_filename = os.path.join(
+            history_dir, f"validate_fks.{target_name}.{timestamp}.sql"
+        )
+        try:
+            with open(validate_filename, "w", encoding="utf-8") as f:
+                f.write("\n".join(fk_validate_sql))
+            print(f"FK validate SQL written to {validate_filename}")
+        except IOError as e:
+            print(f"Error writing FK validate file {validate_filename}: {e}")
+
     if args.with_data:
         print("\n-- Running Data Migration --")
         
@@ -1711,7 +1843,7 @@ def main():
         tgt_conn = get_connection(target_config)
         
         try:
-            run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks)
+            run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks, config_path=config_path)
             print("\nData migration completed and committed.")
 
             # 데이터 마이그레이션 이후 시퀀스 검증 및 수정 실행

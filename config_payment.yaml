@@ -1,0 +1,24 @@
+# SUPABASE PAYMENT DB -> GCP PROD PAYMENT DB
+source:
+  host: aws-0-ap-northeast-2.pooler.supabase.com
+  port: 6543
+  dbname: postgres
+  user: postgres.rjcnawaamsdugcavtvsn
+  password: WwE8SRsh9JRmpi!
+
+# GCP PROD PAYMENT DB
+targets:
+  gcp:
+    host: 34.64.203.171
+    port: 5432
+    dbname: postgres
+    user: postgres
+    password: S0ZkrFIrL44YSbzt
+# GCP DEV PAYMENT DB
+# targets:
+#   gcp:
+#     host: 34.47.71.47
+#     port: 5432
+#     dbname: postgres
+#     user: postgres
+#     password: 76yU4A4FnthGpdmM

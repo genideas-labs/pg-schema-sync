@@ -96,7 +96,7 @@ if __name__ == '__main__':
         sys.exit(1)
     
     source_config = config['source']
-    target_config = config['targets']['gcp_test']
+    target_config = config['targets']['gcp']
     
     # psycopg2 형식으로 변환
     if 'db' in source_config:

@@ -6,7 +6,7 @@ import yaml
 with open('config.yaml') as f:
     config = yaml.safe_load(f)
 
-conn = psycopg2.connect(**config['targets']['gcp_test'])
+conn = psycopg2.connect(**config['targets']['gcp'])
 cur = conn.cursor()
 
 # 현재 활성 연결 확인

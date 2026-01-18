@@ -6,70 +6,28 @@ import datetime # 타임스탬프용
 import os # 디렉토리 생성용
 import argparse # 커맨드라인 인수 처리용
 import re # SQL 정규화용
-import sys
 from collections import defaultdict
+import sys
+
+# 상대 import와 절대 import 모두 지원
 try:
     from .dataMig import run_data_migration_parallel, compare_row_counts
 except ImportError:
     from dataMig import run_data_migration_parallel, compare_row_counts
+# 스냅샷 함수 임포트
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from snapshot_row_counts import create_snapshot_from_conn
+from compare_snapshots import compare_snapshots
 # --- 제외할 객체 목록 ---
 # Liquibase 등 마이그레이션 도구 관련 테이블 또는 기타 제외 대상
 EXCLUDE_TABLES = ['databasechangelog', 'databasechangeloglock']
 # 관련 인덱스 또는 기타 제외 대상
 EXCLUDE_INDEXES = ['databasechangeloglock_pkey'] # 필요시 타겟 전용 인덱스 추가
 
-DEFAULT_CONFIG_PATH = "config.yaml"
-AUTO_INSTALL_EXTENSIONS = {"pg_trgm", "postgis", "vector"}
-
 # --- DB 연결 함수 ---
 def get_connection(config):
     conn = psycopg2.connect(**config)
     return conn
-
-def load_config(config_path):
-    """Load config YAML from a given path."""
-    try:
-        with open(config_path, 'r', encoding='utf-8') as stream:
-            config = yaml.safe_load(stream)
-            if not config:
-                print(f"Error: {config_path} is empty or invalid.")
-                return None
-            return config
-    except FileNotFoundError:
-        print(f"Error: {config_path} not found.")
-        return None
-    except yaml.YAMLError as exc:
-        print(f"Error parsing {config_path}: {exc}")
-        return None
-    except Exception as e:
-        print(f"An unexpected error occurred while reading {config_path}: {e}")
-        return None
-
-def fetch_extensions(conn):
-    """Fetch installed extensions from the connected database."""
-    cur = conn.cursor()
-    cur.execute("SELECT extname FROM pg_extension;")
-    extensions = {row[0] for row in cur.fetchall()}
-    cur.close()
-    return extensions
-
-def get_extension_diffs(src_conn, tgt_conn, allowlist=None):
-    """Return missing extensions and those skipped by allowlist."""
-    src_exts = fetch_extensions(src_conn)
-    tgt_exts = fetch_extensions(tgt_conn)
-    missing = src_exts - tgt_exts
-    if allowlist is None:
-        return sorted(missing), []
-    allowed_missing = sorted(missing & allowlist)
-    skipped_missing = sorted(missing - allowlist)
-    return allowed_missing, skipped_missing
-
-def build_extension_sql(extensions):
-    """Build CREATE EXTENSION statements."""
-    return [
-        f"-- EXTENSION {ext}\nCREATE EXTENSION IF NOT EXISTS {ext};\n"
-        for ext in extensions
-    ]
 
 # --- Enum DDL 조회 ---
 def fetch_enums(conn):
@@ -274,14 +232,14 @@ def fetch_tables_metadata(conn):
     tables_metadata = {}
     for table_name in table_names:
         cur.execute("""
-        SELECT column_name, data_type, is_nullable, udt_name, column_default, is_identity, identity_generation, is_generated
+        SELECT column_name, data_type, is_nullable, udt_name, column_default, is_identity
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = %s
         ORDER BY ordinal_position;
         """, (table_name,))
 
         columns = []
-        for col_name, data_type, is_nullable, udt_name, col_default, is_identity, identity_generation, is_generated in cur.fetchall():
+        for col_name, data_type, is_nullable, udt_name, col_default, is_identity in cur.fetchall():
             col_type = data_type
             if data_type == 'ARRAY':
                 base_type = udt_name.lstrip('_')
@@ -297,9 +255,7 @@ def fetch_tables_metadata(conn):
                 'type': col_type,
                 'nullable': is_nullable == 'YES',
                 'default': col_default,
-                'identity': identity_flag,  # 수정된 identity_flag 사용
-                'identity_generation': identity_generation,
-                'generated': is_generated == 'ALWAYS'
+                'identity': identity_flag  # 수정된 identity_flag 사용
             }
             if (table_name, col_name) in fk_lookup:
                 col_data['foreign_key'] = fk_lookup[(table_name, col_name)]
@@ -536,9 +492,6 @@ def fetch_views(conn):
     cur.execute(query)
     views = {}
     for view_name, view_def in cur.fetchall():
-        if view_def is None:
-            print(f"Warning: view definition not available for {view_name}. Skipping.")
-            continue
         # view_definition은 SELECT 문만 포함하므로 CREATE OR REPLACE VIEW 추가
         # view_definition 끝에 세미콜론이 있을 수 있으므로 제거 후 추가
         ddl = f"CREATE OR REPLACE VIEW public.{view_name} AS\n{view_def.rstrip(';')};"
@@ -675,50 +628,12 @@ def verify_sequence_values(conn, tables_metadata):
                 seq_name = f"{table_name}_{col_name}_seq"
                 
                 try:
-                    # 타겟에 테이블/컬럼/시퀀스가 존재하지 않으면 스킵
-                    cur.execute("""
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_schema = 'public' AND table_name = %s
-                    """, (table_name,))
-                    if not cur.fetchone():
-                        print(f"  ⏭️  {table_name}: table not found in target, skipping")
-                        continue
-
-                    cur.execute("""
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = %s AND column_name = %s
-                    """, (table_name, col_name))
-                    if not cur.fetchone():
-                        print(f"  ⏭️  {table_name}.{col_name}: column not found in target, skipping")
-                        continue
-
-                    cur.execute("""
-                    SELECT 1
-                    FROM pg_class c
-                    JOIN pg_namespace n ON c.relnamespace = n.oid
-                    WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relname = %s
-                    """, (seq_name,))
-                    if not cur.fetchone():
-                        print(f"  ⏭️  {seq_name}: sequence not found in target, skipping")
-                        continue
-
                     # 시퀀스의 last_value 조회
-                    cur.execute(
-                        sql.SQL("SELECT last_value FROM {}").format(
-                            sql.Identifier("public", seq_name)
-                        )
-                    )
+                    cur.execute(f"SELECT last_value FROM public.{seq_name}")
                     seq_last_value = cur.fetchone()[0]
                     
                     # 테이블의 최대 ID 값 조회
-                    cur.execute(
-                        sql.SQL("SELECT COALESCE(MAX({col}), 0) FROM {}").format(
-                            sql.Identifier("public", table_name),
-                            col=sql.Identifier(col_name),
-                        )
-                    )
+                    cur.execute(f"SELECT COALESCE(MAX({col_name}), 0) FROM public.{table_name}")
                     table_max_id = cur.fetchone()[0]
                     
                     print(f"  📊 {table_name}.{col_name}:")
@@ -736,16 +651,12 @@ def verify_sequence_values(conn, tables_metadata):
                         print(f"      Updating sequence value to match table max ID")
                         
                         # 시퀀스 값을 테이블 최대 ID로 업데이트
-                        setval_sql = "SELECT setval(%s, %s, true)"
-                        print(f"      Executing: SELECT setval('public.{seq_name}', {table_max_id}, true)")
-                        cur.execute(setval_sql, (f"public.{seq_name}", table_max_id))
+                        setval_sql = f"SELECT setval('public.{seq_name}', {table_max_id}, true)"
+                        print(f"      Executing: {setval_sql}")
+                        cur.execute(setval_sql)
                         
                         # 업데이트 후 값 확인
-                        cur.execute(
-                            sql.SQL("SELECT last_value FROM {}").format(
-                                sql.Identifier("public", seq_name)
-                            )
-                        )
+                        cur.execute(f"SELECT last_value FROM public.{seq_name}")
                         new_last_value = cur.fetchone()[0]
                         print(f"      After setval: last_value={new_last_value}")
                         print(f"  ✅ {seq_name}: updated from {seq_last_value} to {table_max_id}")
@@ -754,7 +665,6 @@ def verify_sequence_values(conn, tables_metadata):
                     print(f"  ❌ {seq_name}: failed to verify/fix - {e}")
                     import traceback
                     traceback.print_exc()
-                    conn.rollback()
 
 def initialize_sequences_after_migration(src_conn, tgt_conn, src_sequences, src_tables_meta):
     """테이블 마이그레이션 이후에 소스 시퀀스의 last_value로 타겟 시퀀스를 초기화합니다."""
@@ -1039,14 +949,12 @@ def is_safe_type_change(old_type, new_type):
 # --- 비교 후 migration SQL 생성 (타입별 로직 분기, Enum DDL 참조 추가, ALTER TABLE 지원 추가) ---
 def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=None, use_alter=False,
                                  src_composite_uniques=None, tgt_composite_uniques=None,
-                                 src_composite_primaries=None, tgt_composite_primaries=None,
-                                 fk_not_valid=False):
+                                 src_composite_primaries=None, tgt_composite_primaries=None):
     """
     소스와 타겟 데이터를 비교하여 마이그레이션 SQL과 건너뛴 SQL을 생성합니다.
     obj_type에 따라 비교 방식을 다르게 적용합니다.
     use_alter=True일 경우, 테이블 컬럼 추가/삭제에 대해 ALTER TABLE 사용 시도.
     Enum 타입의 DDL 생성을 위해 src_enum_ddls 딕셔너리가 필요합니다.
-    fk_not_valid=True이면 FOREIGN KEY를 NOT VALID로 생성합니다.
     """
     migration_sql = []
     skipped_sql = []
@@ -1081,26 +989,39 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
             ddl = src_enum_ddls.get(name, f"-- ERROR: DDL not found for Enum {name}")
         elif obj_type == "SEQUENCE": # 소스에만 있는 Sequence 처리
             raw_ddl = src_data.get(name, f"-- ERROR: DDL not found for Sequence {name}")
-            # 테이블 생성 시 자동으로 생성된 시퀀스가 있을 수 있으므로 값만 업데이트
+            # 명시적으로 생성된 시퀀스: 없으면 생성하고 값 설정
             restart_match = re.search(r'RESTART WITH (\d+)', raw_ddl)
             if restart_match:
                 restart_value = restart_match.group(1)
                 ddl = f"""
                         DO $$
                         BEGIN
-                            -- 시퀀스가 존재하면 값만 업데이트
-                            IF EXISTS (
+                            -- 시퀀스가 없으면 생성
+                            IF NOT EXISTS (
                                 SELECT 1 FROM pg_class c 
                                 JOIN pg_namespace n ON c.relnamespace = n.oid 
                                 WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relname = '{name}'
                             ) THEN
-                                ALTER SEQUENCE public.{name} RESTART WITH {restart_value};
+                                CREATE SEQUENCE public.{name};
                             END IF;
+                            -- 시퀀스 값 설정
+                            PERFORM setval('public.{name}', {restart_value}, true);
                         END$$;
                         """.strip()
             else:
-                # RESTART WITH가 없으면 아무것도 하지 않음 (시퀀스가 자동으로 생성됨)
-                ddl = f"-- Sequence {name} is auto-generated by table, skipping explicit creation"
+                # RESTART WITH가 없으면 기본값으로 생성
+                ddl = f"""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_class c 
+                                JOIN pg_namespace n ON c.relnamespace = n.oid 
+                                WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relname = '{name}'
+                            ) THEN
+                                CREATE SEQUENCE public.{name};
+                            END IF;
+                        END$$;
+                        """.strip()
         elif obj_type == "INDEX":
             raw_ddl = src_data.get(name, f"-- ERROR: DDL not found for Index {name}")
             ddl = f"""
@@ -1115,8 +1036,6 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                     """.strip()    
         else: # View, Function, Index 등
             ddl = src_data.get(name, f"-- ERROR: DDL not found for {obj_type} {name}")
-        if obj_type == "FOREIGN_KEY" and fk_not_valid:
-            ddl = add_not_valid_constraint(ddl)
         migration_sql.append(f"-- CREATE {obj_type} {name}\n{ddl}\n")
 
     # 양쪽에 모두 있는 객체 비교 처리
@@ -1300,8 +1219,6 @@ def compare_and_generate_migration(src_data, tgt_data, obj_type, src_enum_ddls=N
                     ddl = src_data[name]
 
             if are_different:
-                if fk_not_valid:
-                    ddl = add_not_valid_constraint(ddl)
                 # ✅ DROP 없이 추가만 시도
                 migration_sql.append(f"-- FOREIGN_KEY {name} differs or missing. Adding.\n{ddl}\n")
             else:
@@ -1519,40 +1436,12 @@ def extract_foreign_keys(metadata, composite_fks):
     
     return fk_map
 
-def add_not_valid_constraint(ddl):
-    """Append NOT VALID to a FK constraint if not already present."""
-    if "NOT VALID" in ddl.upper():
-        return ddl
-    stripped = ddl.rstrip()
-    if stripped.endswith(";"):
-        return stripped[:-1] + " NOT VALID;"
-    return stripped + " NOT VALID"
-
-def build_fk_validate_statements(migration_sql_blocks):
-    """Build VALIDATE CONSTRAINT statements from FK migration blocks."""
-    validate_sql = []
-    pattern = re.compile(
-        r'ALTER\\s+TABLE\\s+public\\."?([^"\\s]+)"?\\s+ADD\\s+CONSTRAINT\\s+"?([^"\\s]+)"?',
-        re.IGNORECASE,
-    )
-    for block in migration_sql_blocks:
-        sql_content = "\n".join(
-            line for line in block.splitlines() if not line.strip().startswith("--")
-        )
-        match = pattern.search(sql_content)
-        if not match:
-            continue
-        table_name, constraint_name = match.groups()
-        validate_sql.append(
-            f'ALTER TABLE public."{table_name}" VALIDATE CONSTRAINT "{constraint_name}";'
-        )
-    return validate_sql
-
 def main():
     # --- 커맨드라인 인수 파싱 ---
     parser = argparse.ArgumentParser(description="Compare source and target PostgreSQL schemas and generate/apply migration SQL, or verify differences.")
-    parser.add_argument('--config', default=DEFAULT_CONFIG_PATH,
-                        help=f"Path to config YAML file (default: {DEFAULT_CONFIG_PATH}).")
+    # Config file path
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help="Path to the configuration YAML file (default: config.yaml)")
     # Verification flag
     parser.add_argument('--verify', action='store_true',
                         help="Only verify schema differences (object names and counts) without generating/executing SQL.")
@@ -1564,17 +1453,8 @@ def main():
                         help="EXPERIMENTAL: Use ALTER TABLE for column additions/deletions instead of DROP/CREATE. Use with caution.")
     parser.add_argument('--with-data', action='store_true',
                     help="Include data migration after schema changes")
-    parser.add_argument('--skip-fk', action='store_true', default=False,
-                        help="Skip foreign key migration.")
-    parser.add_argument('--fk-not-valid', action='store_true', default=False,
-                        help="Add foreign keys as NOT VALID and write a validate SQL file.")
-    parser.add_argument('--install-extensions', action=argparse.BooleanOptionalAction, default=True,
-                        help="Detect missing extensions and add CREATE EXTENSION statements (default: enabled).")
     args = parser.parse_args()
     # --- 인수 파싱 끝 ---
-    if args.skip_fk and args.fk_not_valid:
-        print("Error: --skip-fk and --fk-not-valid are mutually exclusive.")
-        return
 
     # 타임스탬프 생성 (YYYYMMDDHHMMSS 형식)
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -1583,21 +1463,34 @@ def main():
     history_dir = "history"
     os.makedirs(history_dir, exist_ok=True)
 
-    config_path = args.config
-    config = load_config(config_path)
-    if not config:
+    # config 파일 로드
+    config_file = args.config
+    try:
+        with open(config_file, 'r', encoding='utf-8') as stream:
+            config = yaml.safe_load(stream)
+            if not config:
+                print(f"Error: {config_file} is empty or invalid.")
+                return
+    except FileNotFoundError:
+        print(f"Error: {config_file} not found.")
+        return
+    except yaml.YAMLError as exc:
+        print(f"Error parsing {config_file}: {exc}")
+        return
+    except Exception as e:
+        print(f"An unexpected error occurred while reading {config_file}: {e}")
         return
 
     # 설정 유효성 검사 및 추출
     if 'source' not in config or not isinstance(config['source'], dict):
-        print(f"Error: 'source' configuration is missing or invalid in {config_path}.")
+        print(f"Error: 'source' configuration is missing or invalid in {config_file}.")
         return
-    if 'targets' not in config or not isinstance(config['targets'], dict) or 'gcp_test' not in config['targets'] or not isinstance(config['targets']['gcp_test'], dict):
-        print(f"Error: 'targets.gcp_test' configuration is missing or invalid in {config_path}.")
+    if 'targets' not in config or not isinstance(config['targets'], dict) or 'gcp' not in config['targets'] or not isinstance(config['targets']['gcp'], dict):
+        print(f"Error: 'targets.gcp' configuration is missing or invalid in {config_file}.")
         return
 
     source_config = config['source']
-    target_config = config['targets']['gcp_test']
+    target_config = config['targets']['gcp']
 
     # psycopg2에서 사용하는 키 이름으로 조정 ('db' -> 'dbname', 'username' -> 'user')
     # source 설정 조정
@@ -1617,7 +1510,7 @@ def main():
     try:
         print("Connecting to source database...")
         src_conn = get_connection(source_config)
-        print("Connecting to target database (gcp_test)...")
+        print("Connecting to target database (gcp)...")
         tgt_conn = get_connection(target_config)
     except psycopg2.Error as e:
         print(f"Database connection error: {e}")
@@ -1625,28 +1518,6 @@ def main():
     except Exception as e:
         print(f"An unexpected error occurred during connection: {e}")
         return
-
-    extension_migration_sql = []
-    if args.verify:
-        missing_extensions, _ = get_extension_diffs(src_conn, tgt_conn, allowlist=None)
-        if missing_extensions:
-            print(f"Missing extensions in target database: {', '.join(missing_extensions)}")
-    else:
-        allowed_missing, skipped_missing = get_extension_diffs(
-            src_conn,
-            tgt_conn,
-            allowlist=AUTO_INSTALL_EXTENSIONS,
-        )
-        if skipped_missing:
-            print("Warning: Missing extensions not in allowlist; install manually:")
-            print(f"  {', '.join(skipped_missing)}")
-        if allowed_missing:
-            if args.install_extensions:
-                print(f"Adding extension setup for: {', '.join(allowed_missing)}")
-                extension_migration_sql = build_extension_sql(allowed_missing)
-            else:
-                print("Missing extensions detected (auto-install disabled):")
-                print(f"  {', '.join(allowed_missing)}")
 
 
     # --- 데이터 조회 ---
@@ -1762,10 +1633,6 @@ def main():
     all_migration_sql = [] # 실제 마이그레이션 SQL 저장
     all_skipped_sql = []   # 건너뛴 SQL 저장
 
-    if extension_migration_sql:
-        all_migration_sql.extend(extension_migration_sql)
-    fk_validate_sql = []
-
     # 순서: enum, table, sequence, view, function, index
     print("Comparing Enums (Values)...")
     # Enum 비교 시 값 목록(values)을 사용하고, DDL 생성을 위해 src_enum_ddls 전달
@@ -1782,41 +1649,29 @@ def main():
     all_migration_sql.extend(mig_sql)
     all_skipped_sql.extend(skip_sql)
 
-    # args.with_data 모드가 아닐 때만 시퀀스 마이그레이션 SQL 생성 (테이블 이후로 이동)
+    # 명시적으로 생성된 시퀀스 마이그레이션 (IDENTITY 시퀀스는 이미 테이블 생성 시 자동 생성됨)
     if not args.with_data:
         print("Comparing Sequences (DDL)...")
         print(f"  Source sequences: {list(src_sequences.keys())}")
         print(f"  Target sequences: {list(tgt_sequences.keys())}")
         
-        # IDENTITY 컬럼의 시퀀스는 테이블 생성 시 자동으로 생성되므로 별도 마이그레이션 불필요
+        # 명시적으로 생성된 시퀀스만 마이그레이션 (IDENTITY는 자동 생성)
         if src_sequences:
-            print("  Note: Sequences will be handled after table creation (for IDENTITY columns)")
+            print(f"  Migrating {len(src_sequences)} explicit sequences")
+            mig_sql, skip_sql = compare_and_generate_migration(src_sequences, tgt_sequences, "SEQUENCE")
+            all_migration_sql.extend(mig_sql)
+            all_skipped_sql.extend(skip_sql)
         else:
-            print("  No sequences to migrate")
-        
-        # 시퀀스 마이그레이션 SQL은 생성하지 않음 (테이블 생성 후 값 동기화로 처리)
-        # mig_sql, skip_sql = compare_and_generate_migration(src_sequences, tgt_sequences, "SEQUENCE")
-        # all_migration_sql.extend(mig_sql)
-        # all_skipped_sql.extend(skip_sql)
+            print("  No explicit sequences to migrate")
 
-    if args.skip_fk:
-        print("Skipping Foreign Keys (--skip-fk enabled)...")
-    else:
-        print("Comparing Foreign Keys...")  # 👈 이 부분 추가
+    print("Comparing Foreign Keys...")  # 👈 이 부분 추가
 
-        src_fk_map = extract_foreign_keys(src_tables_meta, src_composite_fks)
-        tgt_fk_map = extract_foreign_keys(tgt_tables_meta, tgt_composite_fks)
+    src_fk_map = extract_foreign_keys(src_tables_meta, src_composite_fks)
+    tgt_fk_map = extract_foreign_keys(tgt_tables_meta, tgt_composite_fks)
 
-        mig_sql, skip_sql = compare_and_generate_migration(
-            src_fk_map,
-            tgt_fk_map,
-            "FOREIGN_KEY",
-            fk_not_valid=args.fk_not_valid,
-        )
-        all_migration_sql.extend(mig_sql)
-        all_skipped_sql.extend(skip_sql)
-        if args.fk_not_valid:
-            fk_validate_sql = build_fk_validate_statements(mig_sql)
+    mig_sql, skip_sql = compare_and_generate_migration(src_fk_map, tgt_fk_map, "FOREIGN_KEY")
+    all_migration_sql.extend(mig_sql)
+    all_skipped_sql.extend(skip_sql)
 
     print("Comparing Views (DDL)...")
     mig_sql, skip_sql = compare_and_generate_migration(src_views, tgt_views, "VIEW")
@@ -1861,22 +1716,29 @@ def main():
     except IOError as e:
         print(f"Error writing skipped file {skipped_filename}: {e}")
 
-    if args.fk_not_valid and fk_validate_sql:
-        validate_filename = os.path.join(
-            history_dir, f"validate_fks.{target_name}.{timestamp}.sql"
-        )
-        try:
-            with open(validate_filename, "w", encoding="utf-8") as f:
-                f.write("\n".join(fk_validate_sql))
-            print(f"FK validate SQL written to {validate_filename}")
-        except IOError as e:
-            print(f"Error writing FK validate file {validate_filename}: {e}")
-
     if args.with_data:
-        print("\n-- Running Data Migration --")
+        print("\n" + "=" * 80)
+        print("📦 DATA MIGRATION WITH SNAPSHOT VALIDATION")
+        print("=" * 80)
+        
+        # 1. Source 스냅샷 생성 (마이그레이션 전)
+        print("\n[1/4] Creating source database snapshot...")
+        try:
+            source_snapshot_path = create_snapshot_from_conn(
+                src_conn, 
+                db_name="source",
+                verbose=True
+            )
+            print(f"✅ Source snapshot created: {source_snapshot_path}")
+        except Exception as e:
+            print(f"❌ Failed to create source snapshot: {e}")
+            src_conn.close()
+            tgt_conn.close()
+            return
         
         # 데이터 마이그레이션 전에 기존 트랜잭션 커밋 및 연결 닫기 (lock 완전 해제)
         # run_data_migration_parallel이 내부에서 새 연결을 생성함
+        print("\n[2/4] Preparing for data migration...")
         print("  Closing existing connections to release all locks...")
         try:
             src_conn.commit()
@@ -1892,17 +1754,9 @@ def main():
         tgt_conn = get_connection(target_config)
         
         try:
-            failed_tables, table_errors = run_data_migration_parallel(
-                src_conn,
-                src_tables_meta,
-                src_composite_fks,
-                config_path=config_path,
-            )
-            data_migration_failed = bool(failed_tables)
-            if data_migration_failed:
-                print("\nData migration completed with failures.")
-            else:
-                print("\nData migration completed and committed.")
+            print("\n[3/4] Running data migration...")
+            run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks, config_file=config_file)
+            print("\n✅ Data migration completed and committed.")
 
             # 데이터 마이그레이션 이후 시퀀스 검증 및 수정 실행
             print(f"\n--- Post-Data Migration Sequence Verification and Correction ---")
@@ -1919,49 +1773,12 @@ def main():
                         seq_name = f"{table_name}_{col_name}_seq"
                         
                         try:
-                            tgt_cur.execute("""
-                            SELECT 1
-                            FROM information_schema.tables
-                            WHERE table_schema = 'public' AND table_name = %s
-                            """, (table_name,))
-                            if not tgt_cur.fetchone():
-                                print(f"  ⏭️  {table_name}: table not found in target, skipping")
-                                continue
-
-                            tgt_cur.execute("""
-                            SELECT 1
-                            FROM information_schema.columns
-                            WHERE table_schema = 'public' AND table_name = %s AND column_name = %s
-                            """, (table_name, col_name))
-                            if not tgt_cur.fetchone():
-                                print(f"  ⏭️  {table_name}.{col_name}: column not found in target, skipping")
-                                continue
-
-                            tgt_cur.execute("""
-                            SELECT 1
-                            FROM pg_class c
-                            JOIN pg_namespace n ON c.relnamespace = n.oid
-                            WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relname = %s
-                            """, (seq_name,))
-                            if not tgt_cur.fetchone():
-                                print(f"  ⏭️  {seq_name}: sequence not found in target, skipping")
-                                continue
-
                             # 타겟 시퀀스의 last_value 조회
-                            tgt_cur.execute(
-                                sql.SQL("SELECT last_value FROM {}").format(
-                                    sql.Identifier("public", seq_name)
-                                )
-                            )
+                            tgt_cur.execute(f"SELECT last_value FROM public.{seq_name}")
                             tgt_last_value = tgt_cur.fetchone()[0]
                             
                             # 타겟 테이블의 최대 ID 값 조회 (데이터 마이그레이션 후)
-                            tgt_cur.execute(
-                                sql.SQL("SELECT COALESCE(MAX({col}), 0) FROM {}").format(
-                                    sql.Identifier("public", table_name),
-                                    col=sql.Identifier(col_name),
-                                )
-                            )
+                            tgt_cur.execute(f"SELECT COALESCE(MAX({col_name}), 0) FROM public.{table_name}")
                             tgt_max_id = tgt_cur.fetchone()[0]
                             
                             print(f"  📊 {table_name}.{col_name}:")
@@ -1979,16 +1796,12 @@ def main():
                                 print(f"      Updating sequence value to match table max ID")
                                 
                                 # 시퀀스 값을 테이블 최대 ID로 업데이트
-                                setval_sql = "SELECT setval(%s, %s, true)"
-                                print(f"      Executing: SELECT setval('public.{seq_name}', {tgt_max_id}, true)")
-                                tgt_cur.execute(setval_sql, (f"public.{seq_name}", tgt_max_id))
+                                setval_sql = f"SELECT setval('public.{seq_name}', {tgt_max_id}, true)"
+                                print(f"      Executing: {setval_sql}")
+                                tgt_cur.execute(setval_sql)
                                 
                                 # 업데이트 후 값 확인
-                                tgt_cur.execute(
-                                    sql.SQL("SELECT last_value FROM {}").format(
-                                        sql.Identifier("public", seq_name)
-                                    )
-                                )
+                                tgt_cur.execute(f"SELECT last_value FROM public.{seq_name}")
                                 new_last_value = tgt_cur.fetchone()[0]
                                 print(f"      After setval: last_value={new_last_value}")
                                 print(f"  ✅ {seq_name}: updated from {tgt_last_value} to {tgt_max_id}")
@@ -1997,7 +1810,6 @@ def main():
                             print(f"  ❌ {seq_name}: failed to verify/correct - {e}")
                             import traceback
                             traceback.print_exc()
-                            tgt_conn.rollback()
             
             # 명시적 시퀀스 값 검증 및 수정 (소스에 명시적 시퀀스가 있는 경우)
             common_sequences = set(src_sequences.keys()) & set(tgt_sequences.keys())
@@ -2013,11 +1825,7 @@ def main():
                             src_last_value, src_is_called = src_cur.fetchone()
                             
                             # 타겟 시퀀스의 현재 값 조회
-                            tgt_cur.execute(
-                                sql.SQL("SELECT last_value, is_called FROM {}").format(
-                                    sql.Identifier("public", seq_name)
-                                )
-                            )
+                            tgt_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
                             tgt_last_value, tgt_is_called = tgt_cur.fetchone()
                             
                             print(f"  📊 {seq_name}:")
@@ -2027,16 +1835,12 @@ def main():
                             # 값이 다른 경우에만 업데이트
                             if src_last_value != tgt_last_value:
                                 # 시퀀스 값을 소스와 동일하게 설정
-                                setval_sql = "SELECT setval(%s, %s, %s)"
-                                print(f"    Executing: SELECT setval('public.{seq_name}', {src_last_value}, {src_is_called})")
-                                tgt_cur.execute(setval_sql, (f"public.{seq_name}", src_last_value, src_is_called))
+                                setval_sql = f"SELECT setval('public.{seq_name}', {src_last_value}, {src_is_called})"
+                                print(f"    Executing: {setval_sql}")
+                                tgt_cur.execute(setval_sql)
                                 
                                 # 업데이트 후 값 확인
-                                tgt_cur.execute(
-                                    sql.SQL("SELECT last_value, is_called FROM {}").format(
-                                        sql.Identifier("public", seq_name)
-                                    )
-                                )
+                                tgt_cur.execute(f"SELECT last_value, is_called FROM public.{seq_name}")
                                 new_tgt_last_value, new_tgt_is_called = tgt_cur.fetchone()
                                 print(f"    After setval: last_value={new_tgt_last_value}, is_called={new_tgt_is_called}")
                                 
@@ -2048,27 +1852,76 @@ def main():
                             print(f"  ❌ {seq_name}: failed to verify/correct - {e}")
                             import traceback
                             traceback.print_exc()
-                            tgt_conn.rollback()
             
             tgt_conn.commit()
-            print("\nSequence verification and correction completed and committed.")
+            print("\n✅ Sequence verification and correction completed and committed.")
             
             # 최종 시퀀스 값 검증
             print(f"\n--- Final Sequence Value Verification ---")
             verify_sequence_values(tgt_conn, src_tables_meta)
-
-            if data_migration_failed:
-                print("Data migration finished with failures.")
-                sys.exit(2)
+            
+            # 2. Target 스냅샷 생성 (마이그레이션 후)
+            print("\n[4/4] Creating target database snapshot...")
+            try:
+                target_snapshot_path = create_snapshot_from_conn(
+                    tgt_conn,
+                    db_name="target",
+                    verbose=True
+                )
+                print(f"✅ Target snapshot created: {target_snapshot_path}")
+            except Exception as e:
+                print(f"❌ Failed to create target snapshot: {e}")
+                src_conn.close()
+                tgt_conn.close()
+                return
+            
+            # 3. 스냅샷 비교 및 리포트 생성
+            print("\n" + "=" * 80)
+            print("🔍 SNAPSHOT COMPARISON & VALIDATION")
+            print("=" * 80)
+            
+            # 리포트 파일명 생성
+            validation_report_filename = os.path.join(
+                history_dir,
+                f"validation_report.{target_name}.{timestamp}.txt"
+            )
+            
+            try:
+                is_identical, report = compare_snapshots(
+                    source_snapshot_path,
+                    target_snapshot_path,
+                    verbose=True,
+                    output_file=validation_report_filename
+                )
+                
+                print("\n" + "=" * 80)
+                print("📊 MIGRATION VALIDATION RESULT")
+                print("=" * 80)
+                
+                if is_identical:
+                    print("\n✅ SUCCESS: All table row counts match!")
+                    print(f"   Source and target databases are in sync.")
+                else:
+                    print("\n⚠️  WARNING: Row count differences detected!")
+                    print(f"   Please review the validation report for details.")
+                
+                print(f"\n📄 Validation report saved: {validation_report_filename}")
+                print(f"📄 Source snapshot: {source_snapshot_path}")
+                print(f"📄 Target snapshot: {target_snapshot_path}")
+                
+            except Exception as e:
+                print(f"\n❌ Error during snapshot comparison: {e}")
+                import traceback
+                traceback.print_exc()
 
         except Exception as e:
-            print(f"Error during data migration: {e}")
+            print(f"\n❌ Error during data migration: {e}")
             tgt_conn.rollback()
             print("Transaction rolled back.")
         finally:
             src_conn.close()
             tgt_conn.close()
-            print("Connections closed.")
+            print("\nConnections closed.")
         return
     # --- 마이그레이션 SQL 실행 (commit 옵션이 True일 경우) ---
     elif args.commit:
@@ -2142,7 +1995,6 @@ def main():
                     src_conn.close()
                     tgt_conn.close()
                     print("Connections closed.")
-                    sys.exit(1)
                     
             except Exception as e:
                 print(f"\nAn unexpected error occurred during SQL execution: {e}")
@@ -2152,7 +2004,6 @@ def main():
                 src_conn.close()
                 tgt_conn.close()
                 print("Connections closed.")
-                sys.exit(1)
 
     # --- SQL 실행 끝 ---
 

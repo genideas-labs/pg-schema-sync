@@ -1,0 +1,24 @@
+# SUPABASE MENU DB -> GCP PROD MENU DB
+source:
+  host: aws-0-ap-northeast-2.pooler.supabase.com
+  port: 6543
+  dbname: postgres
+  user: postgres.hszfgulbsaxwqiinsjca
+  password: Q7yJXJeETUeGGyib
+
+# GCP PROD MENU DB
+targets:
+  gcp:
+    host: 34.64.107.127
+    port: 5432
+    dbname: postgres
+    user: postgres
+    password: 3JcsuqDaCqqVKIiL
+# GCP DEV MENU DB
+# targets:
+#   gcp:
+#     host: 34.22.101.228
+#     port: 5432
+#     dbname: postgres
+#     user: postgres
+#     password: M7nIcpuI9iV6jiPl

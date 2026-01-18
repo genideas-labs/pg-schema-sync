@@ -6,7 +6,7 @@ import yaml
 with open("config.yaml", 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
-target_config = config['targets']['gcp_test']
+target_config = config['targets']['gcp']
 
 # 연결
 conn = psycopg2.connect(

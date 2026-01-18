@@ -24,129 +24,109 @@ def migrate_single_table_with_conn(src_conn, tgt_conn, table_name, table_meta):
                 return True, None
 
             column_names = [desc[0] for desc in src_cur.description]
-            column_meta = {col['name']: col for col in table_meta}
+            quoted_column_names = [f'"{col}"' for col in column_names]
+            values_placeholders = ", ".join(["%s"] * len(column_names))
+
+            # Primary key 컬럼들을 table_meta에서 찾기
+            pk_columns = [col['name'] for col in table_meta if col.get('primary_key', False)]
+            
+            # PK가 있으면 ON CONFLICT 절 사용, 없으면 빈 문자열
+            if pk_columns:
+                quoted_pk_columns = [f'"{col}"' for col in pk_columns]
+                conflict_clause = f"ON CONFLICT ({', '.join(quoted_pk_columns)}) DO NOTHING"
+            else:
+                conflict_clause = ""
+
             column_type_map = {col['name']: col['type'] for col in table_meta}
-
-            tgt_cur.execute("""
-            SELECT column_name, is_generated, data_type, udt_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = %s
-            """, (table_name,))
-            target_columns = {}
-            for col_name, is_generated, data_type, udt_name in tgt_cur.fetchall():
-                if data_type == 'ARRAY':
-                    base_type = udt_name.lstrip('_')
-                    col_type = base_type + '[]'
-                else:
-                    col_type = data_type
-                target_columns[col_name] = {
-                    "is_generated": is_generated,
-                    "type": col_type,
-                }
-
-            selected_columns = []
-            selected_indexes = []
-            skipped_columns = []
-            target_type_map = {}
-            json_mismatch_columns = []
-            for idx, col_name in enumerate(column_names):
-                target_info = target_columns.get(col_name)
-                if target_info is None:
-                    skipped_columns.append(col_name)
-                    continue
-                if target_info["is_generated"] == 'ALWAYS' or column_meta.get(col_name, {}).get("generated"):
-                    skipped_columns.append(col_name)
-                    continue
-                target_type = target_info["type"]
-                target_type_map[col_name] = target_type
-                source_type = column_type_map.get(col_name)
-                if target_type in ("json", "jsonb") and source_type not in ("json", "jsonb"):
-                    json_mismatch_columns.append(
-                        f"{col_name} ({source_type or 'unknown'} -> {target_type})"
-                    )
-                selected_columns.append(col_name)
-                selected_indexes.append(idx)
-
-            if skipped_columns:
-                print(f"  ℹ️  {table_name}: Skipping columns: {', '.join(skipped_columns)}", flush=True)
-            if json_mismatch_columns:
-                print(
-                    f"  ⚠️  {table_name}: JSON type mismatch detected: {', '.join(json_mismatch_columns)}",
-                    flush=True,
-                )
-                print(
-                    "     EN: Values will be serialized to JSON to avoid insert errors.",
-                    flush=True,
-                )
-                print(
-                    "     KO: 삽입 오류 방지를 위해 값을 JSON으로 직렬화합니다.",
-                    flush=True,
-                )
-
-            if not selected_columns:
-                print(f"  ⏭️  {table_name}: No insertable columns, skipped", flush=True)
-                return True, None
-
-            quoted_column_names = [f'"{col}"' for col in selected_columns]
-            values_placeholders = ", ".join(["%s"] * len(selected_columns))
-
-            conflict_clause = "ON CONFLICT DO NOTHING"
-
-            override_identity = any(
-                column_meta.get(col_name, {}).get("identity_generation") == "ALWAYS"
-                for col_name in selected_columns
-            )
-            override_clause = "OVERRIDING SYSTEM VALUE" if override_identity else ""
 
             insert_sql = f'''
                 INSERT INTO public."{table_name}" ({", ".join(quoted_column_names)})
-                {override_clause}
                 VALUES ({values_placeholders})
                 {conflict_clause}
             '''
 
             serialized_rows = [
                 tuple(
-                    serialize_value(
-                        row[idx],
-                        column_type_map.get(col_name),
-                        target_type_map.get(col_name),
-                    )
-                    for idx, col_name in zip(selected_indexes, selected_columns)
+                    serialize_value(val, column_type_map.get(col_name))
+                    for val, col_name in zip(row, column_names)
                 )
                 for row in rows
             ]
             
-            tgt_cur.executemany(insert_sql, serialized_rows)
-            tgt_conn.commit()
-            print(f"  ✅ {table_name}: Inserted {len(rows)} rows", flush=True)
+            # 1. 먼저 배치 insert 시도 (빠른 방법)
+            try:
+                tgt_cur.executemany(insert_sql, serialized_rows)
+                tgt_conn.commit()
+                print(f"  ✅ {table_name}: Inserted {len(rows)} rows", flush=True)
+            except Exception as batch_error:
+                # 2. 배치 실패 시 개별 insert로 재시도 (안정성)
+                tgt_conn.rollback()
+                error_type = type(batch_error).__name__
+                print(f"    ⚠️  {table_name}: Batch insert failed ({error_type}), retrying row by row...", flush=True)
+                
+                inserted_count = 0
+                failed_count = 0
+                first_errors = []
+                
+                for row_data in serialized_rows:
+                    try:
+                        tgt_cur.execute(insert_sql, row_data)
+                        tgt_conn.commit()  # 각 row마다 즉시 commit
+                        inserted_count += 1
+                    except Exception as row_error:
+                        tgt_conn.rollback()  # 에러 발생 시 rollback하여 트랜잭션 초기화
+                        failed_count += 1
+                        # 처음 3개의 에러만 저장
+                        if len(first_errors) < 3:
+                            first_errors.append(type(row_error).__name__)
+                
+                # 결과 출력 및 성공 여부 판단
+                success_rate = (inserted_count / len(rows)) * 100 if len(rows) > 0 else 0
+                
+                if first_errors:
+                    error_summary = ", ".join(set(first_errors))
+                    print(f"    Common errors: {error_summary}", flush=True)
+                
+                if failed_count > 0:
+                    print(f"  ⚠️  {table_name}: Inserted {inserted_count}/{len(rows)} rows ({failed_count} failed, {success_rate:.1f}% success)", flush=True)
+                    
+                    # 50% 이상 실패하면 에러로 처리
+                    if success_rate < 50:
+                        return False, f"Too many rows failed: {failed_count}/{len(rows)}"
+                else:
+                    print(f"  ✅ {table_name}: Inserted {inserted_count} rows (retry succeeded)", flush=True)
+        
         return True, None
 
     except Exception as e:
-        # 롤백하고 에러 리포트
-        tgt_conn.rollback()
+        # 연결 관련 에러는 상위로 전파하여 재연결 시도
+        error_msg = str(e).lower()
+        error_type = type(e).__name__.lower()
+        
+        # 연결 에러 타입 체크
+        is_connection_error = (
+            'ssl' in error_msg or 
+            'connection' in error_msg or 
+            'closed' in error_msg or 
+            'interface' in error_type or 
+            'operational' in error_type
+        )
+        
+        # 모든 에러에서 롤백 시도 (트랜잭션 정리)
+        try:
+            tgt_conn.rollback()
+        except:
+            pass  # 롤백 실패해도 무시
+        
+        if is_connection_error:
+            print(f"  ⚠️  {table_name}: Connection error: {type(e).__name__}", flush=True)
+            raise  # 연결 에러는 재연결을 위해 상위로 전파
+        
+        # 일반 에러 처리
         print(f"  ❌ {table_name}: {type(e).__name__}: {str(e)}", flush=True)
         return False, str(e)
 
-def serialize_json_value(val):
-    if val is None:
-        return None
-    if isinstance(val, set):
-        val = list(val)
-    if isinstance(val, bytes):
-        val = val.decode("utf-8", errors="replace")
-    if isinstance(val, str):
-        try:
-            json.loads(val)
-            return val
-        except Exception:
-            return json.dumps(val)
-    return json.dumps(val)
-
-
-def serialize_value(val, pg_type=None, target_type=None):
-    if target_type in ("json", "jsonb"):
-        return serialize_json_value(val)
+def serialize_value(val, pg_type=None):
     if isinstance(val, list):
         if pg_type and (pg_type.endswith('[]') or pg_type.startswith('_')):
             if not val:
@@ -155,8 +135,7 @@ def serialize_value(val, pg_type=None, target_type=None):
             for v in val:
                 if isinstance(v, str):
                     # 문자열 원소일 경우 이스케이프
-                    escaped = v.replace('"', '\\"')
-                    escaped_items.append(f'"{escaped}"')
+                    escaped_items.append(f'"{v.replace(chr(34), r"\\\"")}"')
                 elif isinstance(v, dict):
                     # dict → JSON 문자열 → 다시 이스케이프
                     json_str = json.dumps(v).replace('"', r'\"')
@@ -327,7 +306,7 @@ def generate_validate_script(fks, output_file='validate_fks.sql'):
     print(f"✅ VALIDATE script generated: {output_file}", flush=True)
     print(f"   Run this script later with: psql -f {output_file}\n", flush=True)
 
-def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=None, max_total_attempts=10, config_path="config.yaml"):
+def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=None, max_total_attempts=10, config_file="config.yaml"):
     # FK 의존성 정렬이 필요 없음 - FK를 미리 DROP하므로
     print("\n--- Starting Parallel Data Migration ---")
     print(f"Total tables to migrate: {len(src_tables_meta)}")
@@ -340,32 +319,22 @@ def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=Non
 
     table_errors = defaultdict(str)
     try:
-        with open(config_path, 'r', encoding='utf-8') as stream:
+        with open(config_file, 'r', encoding='utf-8') as stream:
             config = yaml.safe_load(stream)
             if not config:
-                print(f"Error: {config_path} is empty or invalid.")
-                return [], {}
+                print(f"Error: {config_file} is empty or invalid.")
+                return
     except FileNotFoundError:
-        print(f"Error: {config_path} not found.")
-        return [], {}
+        print(f"Error: {config_file} not found.")
+        return
     except yaml.YAMLError as exc:
-        print(f"Error parsing {config_path}: {exc}")
-        return [], {}
+        print(f"Error parsing {config_file}: {exc}")
+        return
     except Exception as e:
-        print(f"An unexpected error occurred while reading {config_path}: {e}")
-        return [], {}
-    target_config = config['targets']['gcp_test'].copy()
-    source_config = config['source'].copy()
-
-    if 'db' in source_config:
-        source_config['dbname'] = source_config.pop('db')
-    if 'username' in source_config:
-        source_config['user'] = source_config.pop('username')
-
-    if 'db' in target_config:
-        target_config['dbname'] = target_config.pop('db')
-    if 'username' in target_config:
-        target_config['user'] = target_config.pop('username')
+        print(f"An unexpected error occurred while reading {config_file}: {e}")
+        return
+    target_config = config['targets']['gcp']
+    source_config = config['source']
     
     # 연결 풀 생성 (병렬 처리용)
     MAX_WORKERS = 5
@@ -383,7 +352,7 @@ def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=Non
     available_connections = list(range(MAX_WORKERS))
     
     def get_conn_from_pool():
-        """연결 풀에서 연결 쌍 가져오기"""
+        """연결 풀에서 연결 쌍 가져오기 (빠른 처리)"""
         with pool_lock:
             if available_connections:
                 idx = available_connections.pop(0)
@@ -400,7 +369,63 @@ def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=Non
         conn_idx, (src_conn, tgt_conn) = get_conn_from_pool()
         try:
             return migrate_single_table_with_conn(src_conn, tgt_conn, table_name, table_meta)
+        except Exception as e:
+            # 에러 발생 시 트랜잭션 초기화 (풀 재사용을 위해)
+            try:
+                tgt_conn.rollback()
+            except:
+                pass
+            
+            # SSL/연결 오류 감지 시 연결 재생성 후 재시도
+            error_msg = str(e).lower()
+            error_type = type(e).__name__.lower()
+            
+            is_connection_error = (
+                'ssl' in error_msg or 
+                'connection' in error_msg or 
+                'closed' in error_msg or 
+                'interface' in error_type or 
+                'operational' in error_type
+            )
+            
+            if is_connection_error:
+                print(f"  🔄 {table_name}: {type(e).__name__} - recreating connection and retrying...", flush=True)
+                try:
+                    # 기존 연결 닫기
+                    try:
+                        src_conn.close()
+                        tgt_conn.close()
+                    except:
+                        pass
+                    
+                    # 새 연결 생성
+                    new_src = get_connection(source_config)
+                    new_tgt = get_connection(target_config)
+                    
+                    # 연결 풀 업데이트
+                    with pool_lock:
+                        connection_pool[conn_idx] = (new_src, new_tgt)
+                    
+                    # 재시도
+                    return migrate_single_table_with_conn(new_src, new_tgt, table_name, table_meta)
+                except Exception as e2:
+                    print(f"  ❌ {table_name}: Retry failed: {type(e2).__name__}: {str(e2)}", flush=True)
+                    # 재시도 실패 시에도 트랜잭션 초기화
+                    try:
+                        new_tgt.rollback()
+                    except:
+                        pass
+                    return False, str(e2)
+            
+            # 다른 오류는 그대로 전파
+            raise
         finally:
+            # 연결 풀 반환 전 트랜잭션 상태 확인 및 초기화
+            try:
+                if tgt_conn and not tgt_conn.closed:
+                    tgt_conn.rollback()  # 혹시 모를 미완료 트랜잭션 정리
+            except:
+                pass
             return_conn_to_pool(conn_idx)
     
     try:
@@ -472,7 +497,6 @@ def run_data_migration_parallel(src_conn, src_tables_meta, src_composite_fks=Non
     else:
         print("\n✅ All tables migrated successfully.")
         print("✅ 데이터 마이그레이션 완료")
-    return remaining_tables, table_errors
     
     
 
